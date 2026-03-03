@@ -1,5 +1,3 @@
-version: "3.9"
-
 # ---------------------------------------------------------------------------
 # NL2SQL Agent — Docker Compose (development)
 #
@@ -33,6 +31,7 @@ services:
       # Explicit overrides — values from .env take lower precedence than these.
       # TODO: Adjust ALLOWED_ORIGINS if you deploy the frontend to a real domain.
       - ALLOWED_ORIGINS=["http://localhost:8085"]
+      - DB_PORT=5432
     volumes:
       # Hot-reload: mount source code so uvicorn --reload picks up changes.
       - ./backend/app:/app/app

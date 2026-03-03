@@ -7,11 +7,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Install system deps required by some Python packages (e.g. mysqlclient, chromadb)
+# Install system deps required by some Python packages (e.g. psycopg2, chromadb)
 RUN apt-get update && apt-get install -y --no-install-recommends \
         gcc \
-        default-libmysqlclient-dev \
-        pkg-config \
+        libpq-dev \
+        curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies

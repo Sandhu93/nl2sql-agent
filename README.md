@@ -58,10 +58,17 @@ Edit `.env` and fill in your values:
 
 ```
 OPENAI_API_KEY=sk-...
-DB_USER=your_db_user
-DB_PASSWORD=your_db_password
-DB_HOST=host.docker.internal   # host machine DB; use service name for Compose-managed DB
-DB_NAME=your_database_name
+DB_USER=postgres
+DB_PASSWORD=1234
+DB_HOST=host.docker.internal   # host machine DB; use service name for a Compose-managed DB
+DB_PORT=5432
+DB_NAME=nl2sql
+```
+
+Create the database before starting the stack:
+
+```bash
+psql -U postgres -c "CREATE DATABASE nl2sql;"
 ```
 
 ### 2. Run with Docker Compose
@@ -148,7 +155,7 @@ Open `backend/app/agent.py` and follow the `TODO` comments:
 
 1. Import `ChatOpenAI`, `SQLDatabase`, `SQLDatabaseToolkit`, and
    `create_react_agent`.
-2. Connect to your MySQL database via `settings.database_url`.
+2. Connect to your PostgreSQL database via `settings.database_url`.
 3. Build the toolkit and create the LangGraph agent with a `MemorySaver`
    checkpointer for per-thread conversation history.
 4. Replace the `run_agent` stub to invoke the real agent and extract the

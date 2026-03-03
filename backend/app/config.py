@@ -14,10 +14,11 @@ class Settings(BaseSettings):
     # OpenAI
     openai_api_key: str = Field(..., description="OpenAI API key")
 
-    # MySQL database
+    # PostgreSQL database
     db_user: str = Field(..., description="Database username")
     db_password: str = Field(..., description="Database password")
     db_host: str = Field(..., description="Database host")
+    db_port: int = Field(default=5432, description="Database port")
     db_name: str = Field(..., description="Database name")
 
     # CORS
@@ -29,8 +30,8 @@ class Settings(BaseSettings):
     @property
     def database_url(self) -> str:
         return (
-            f"mysql+pymysql://{self.db_user}:{self.db_password}"
-            f"@{self.db_host}/{self.db_name}"
+            f"postgresql+psycopg2://{self.db_user}:{self.db_password}"
+            f"@{self.db_host}:{self.db_port}/{self.db_name}"
         )
 
 

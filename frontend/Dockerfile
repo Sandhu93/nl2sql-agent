@@ -4,8 +4,8 @@
 FROM node:20-alpine AS deps
 WORKDIR /app
 COPY package.json package-lock.json* ./
-# Install with --legacy-peer-deps in case of minor peer mismatches
-RUN npm ci --legacy-peer-deps
+# Use npm install (not ci) since no lockfile exists yet; generates one inside the image.
+RUN npm install --legacy-peer-deps
 
 # ---- builder stage ----
 FROM node:20-alpine AS builder
