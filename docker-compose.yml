@@ -1,0 +1,70 @@
+version: "3.9"
+
+# ---------------------------------------------------------------------------
+# NL2SQL Agent — Docker Compose (development)
+#
+# Services:
+#   backend  — FastAPI on port 8086
+#   frontend — Next.js on port 8085
+#
+# Usage:
+#   cp .env.example .env   # fill in your secrets
+#   docker compose up --build
+# ---------------------------------------------------------------------------
+
+networks:
+  app_net:
+    driver: bridge
+
+services:
+  # --------------------------------------------------------------------------
+  # FastAPI backend
+  # --------------------------------------------------------------------------
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: nl2sql_backend
+    ports:
+      - "8086:8086"
+    env_file:
+      - .env
+    environment:
+      # Explicit overrides — values from .env take lower precedence than these.
+      # TODO: Adjust ALLOWED_ORIGINS if you deploy the frontend to a real domain.
+      - ALLOWED_ORIGINS=["http://localhost:8085"]
+    volumes:
+      # Hot-reload: mount source code so uvicorn --reload picks up changes.
+      - ./backend/app:/app/app
+    networks:
+      - app_net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8086/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # --------------------------------------------------------------------------
+  # Next.js frontend
+  # --------------------------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: nl2sql_frontend
+    ports:
+      - "8085:8085"
+    env_file:
+      - .env
+    environment:
+      # Expose the backend URL to client-side code.
+      # TODO: Change to the backend's public URL when deploying beyond localhost.
+      - NEXT_PUBLIC_BACKEND_URL=http://localhost:8086
+    networks:
+      - app_net
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped

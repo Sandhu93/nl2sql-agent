@@ -1,0 +1,28 @@
+# syntax=docker/dockerfile:1
+FROM python:3.11-slim AS base
+
+# Prevent .pyc files and enable stdout/stderr flushing
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+# Install system deps required by some Python packages (e.g. mysqlclient, chromadb)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc \
+        default-libmysqlclient-dev \
+        pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r requirements.txt
+
+# Copy application source
+COPY app/ ./app/
+
+EXPOSE 8086
+
+# TODO: Switch reload=False for a production build (remove --reload flag)
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8086", "--reload"]
