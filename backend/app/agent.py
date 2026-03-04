@@ -299,6 +299,27 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
     logger.info("Query result: %s", result)
 
     # Step 5 — Rephrase the raw DB result into a natural language answer.
+    # Guard: if the query ran without error but returned no rows, skip the
+    # rephrase chain (it would hallucinate a confusing non-answer) and tell
+    # the user directly so they know to refine the question.
+    if _is_sql_error(result):
+        answer = f"The query could not be executed after {_MAX_SQL_RETRIES} correction attempts. Last error: {result}"
+        logger.warning("Returning error answer | thread_id=%s", thread_id)
+        history.add_user_message(question)
+        history.add_ai_message(answer)
+        return {"answer": answer, "sql": sql}
+
+    if not result or not result.strip():
+        answer = (
+            "The query ran successfully but returned no results. "
+            "The database may not contain data matching that question — "
+            "try rephrasing or ask a related question."
+        )
+        logger.warning("Empty query result | thread_id=%s | sql=%s", thread_id, sql)
+        history.add_user_message(question)
+        history.add_ai_message(answer)
+        return {"answer": answer, "sql": sql}
+
     answer: str = await rephrase_answer.ainvoke({
         "question": question,
         "query": sql,

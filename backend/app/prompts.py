@@ -63,13 +63,13 @@ IPL_EXAMPLES = [
         ),
     },
     {
-        "input": "Which team has won the most IPL titles?",
+        "input": "Which team has won the most IPL matches?",
         "query": (
-            "SELECT winner, COUNT(*) AS titles "
+            "SELECT winner, COUNT(*) AS wins "
             "FROM matches "
-            "WHERE match_type = 'Final' "
+            "WHERE winner IS NOT NULL "
             "GROUP BY winner "
-            "ORDER BY titles DESC "
+            "ORDER BY wins DESC "
             "LIMIT 5;"
         ),
     },
