@@ -334,6 +334,17 @@ def _clean_sql(raw: str) -> str:
     return _strip_prefix_and_prose(text)
 
 
+def _is_sql_error(result: str) -> bool:
+    """
+    Return True if QuerySQLDataBaseTool returned a database error string.
+
+    QuerySQLDataBaseTool does NOT raise on SQL failure — it returns the
+    exception message as a plain string starting with 'Error:'.  We must
+    detect this pattern to decide whether to retry via _fix_sql().
+    """
+    return result.strip().startswith("Error:")
+
+
 async def _run_sql(execute_query: QuerySQLDataBaseTool, sql: str) -> str:
     """
     Execute one or more SQL statements separated by semicolons.
@@ -545,24 +556,33 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
     logger.info("Cleaned SQL: %s", sql)
 
     # Step 4 — Execute with automatic error correction on failure.
-    # If the LLM produced bad SQL (e.g. wrong CTE alias, non-existent column),
-    # feed the error back to _fix_sql and retry up to _MAX_SQL_RETRIES times.
+    # IMPORTANT: QuerySQLDataBaseTool never raises on SQL errors — it returns
+    # the psycopg2 exception as a plain string starting with "Error:".
+    # We detect that pattern with _is_sql_error() and drive the retry loop on
+    # it, rather than relying on try/except which would never trigger.
     sql_to_run = sql
     result: str = ""
     for attempt in range(1 + _MAX_SQL_RETRIES):
         try:
             result = await _run_sql(execute_query, sql_to_run)
+        except Exception as exc:
+            result = f"Error: {exc}"
+
+        if not _is_sql_error(result):
             sql = sql_to_run  # keep the (possibly corrected) SQL for the response
             break
-        except Exception as exc:
-            if attempt == _MAX_SQL_RETRIES:
-                raise
-            logger.warning(
-                "SQL execution failed (attempt %d/%d): %s",
-                attempt + 1, 1 + _MAX_SQL_RETRIES, exc,
-            )
-            sql_to_run = await _fix_sql(sql_to_run, question, str(exc), table_names)
-            logger.info("Corrected SQL (attempt %d): %s", attempt + 2, sql_to_run)
+
+        if attempt == _MAX_SQL_RETRIES:
+            logger.error("SQL correction exhausted %d retries. Last error: %s", _MAX_SQL_RETRIES, result)
+            sql = sql_to_run
+            break
+
+        logger.warning(
+            "SQL execution failed (attempt %d/%d): %s",
+            attempt + 1, 1 + _MAX_SQL_RETRIES, result,
+        )
+        sql_to_run = await _fix_sql(sql_to_run, question, result, table_names)
+        logger.info("Corrected SQL (attempt %d): %s", attempt + 2, sql_to_run)
     logger.info("Query result: %s", result)
 
     # Step 5 — Rephrase the raw DB result into a natural language answer.

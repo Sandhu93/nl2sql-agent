@@ -442,3 +442,50 @@ available_tables = set(_db.get_usable_table_names())
 raw_selection = await select_table.ainvoke({"question": question})
 table_names = [t for t in raw_selection if t in available_tables]
 ```
+
+---
+
+## #18 — SQL error correction loop never triggered: `QuerySQLDataBaseTool` returns errors as strings, not exceptions
+
+**Symptom**
+SQL with a bad CTE alias (`b.batsman` where alias `b` was never defined) failed with `missing FROM-clause entry for table "b"`. The retry loop was expected to call `_fix_sql()` and generate a corrected query, but instead the raw error string flowed straight to `rephrase_answer`, which just explained the error back to the user.
+
+Docker log showed:
+```
+INFO | app.agent | Query result: Error: (psycopg2.errors.UndefinedTable) missing FROM-clause entry for table "b"
+INFO | app.agent | Rephrased answer: The SQL query provided contains an error...
+```
+
+No "Corrected SQL" log line ever appeared — `_fix_sql` was never called.
+
+**Root cause**
+`QuerySQLDataBaseTool.ainvoke()` **does not raise an exception on SQL failure**. It catches the psycopg2 exception internally and returns the error as a plain string starting with `"Error:"`. The retry loop used `try/except`, which only fires on raised exceptions — so it always "succeeded" (no exception raised), broke out of the loop with `result = "Error: ..."`, and passed that error string to `rephrase_answer`.
+
+**Fix**
+Added `_is_sql_error(result)` to detect the error-string pattern, and restructured the retry loop to check the result value instead of catching exceptions:
+
+```python
+def _is_sql_error(result: str) -> bool:
+    """QuerySQLDataBaseTool returns errors as strings, not exceptions."""
+    return result.strip().startswith("Error:")
+```
+
+```python
+# Before — try/except never fires for SQL errors
+try:
+    result = await _run_sql(execute_query, sql_to_run)
+    sql = sql_to_run
+    break
+except Exception as exc:
+    ...  # ← never reached for SQL errors
+
+# After — check result string
+result = await _run_sql(execute_query, sql_to_run)
+
+if not _is_sql_error(result):
+    sql = sql_to_run
+    break   # success
+
+# result is an error string → retry via _fix_sql
+sql_to_run = await _fix_sql(sql_to_run, question, result, table_names)
+```
