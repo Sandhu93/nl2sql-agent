@@ -272,3 +272,173 @@ async def _run_sql(execute_query, sql: str) -> str:
         results.append(await execute_query.ainvoke(stmt))
     return "\n".join(results)
 ```
+
+---
+
+## #14 — LLM uses wrong CTE alias in SELECT clause
+
+**Symptom**
+```
+Error: (psycopg2.errors.UndefinedColumn) column bp.total_runs does not exist
+LINE 8: SELECT b.player, bp.total_runs, bp.total_wickets, ...
+```
+
+For the question *"who is the best allrounder in IPL?"*, the LLM generated a query with two CTEs aliased as `b` (batting_performance) and `bp` (bowling_performance). In the final `SELECT` it correctly used `b.player` but then referenced `bp.total_runs` — a column that lives in the `b` CTE, not `bp`.
+
+**Root cause**
+GPT-4o occasionally confuses CTE aliases when both are short and similar (`b` vs `bp`). The model wrote `bp.total_runs` instead of `b.total_runs` in the `SELECT` and `ORDER BY` clauses. This is a hallucination at the alias-resolution level that no amount of SQL cleaning can catch — it requires re-generation with the error context.
+
+**Fix**
+Added `_fix_sql()` async coroutine and a retry loop in `run_agent()`. When `_run_sql()` raises, the failing SQL, the psycopg2 error message, and the relevant table schema are fed back to the LLM, which returns a corrected query. The loop retries up to `_MAX_SQL_RETRIES = 2` times before propagating the exception.
+
+```python
+# In run_agent() — replaces the single _run_sql() call:
+sql_to_run = sql
+for attempt in range(1 + _MAX_SQL_RETRIES):
+    try:
+        result = await _run_sql(execute_query, sql_to_run)
+        sql = sql_to_run   # keep corrected SQL for the response
+        break
+    except Exception as exc:
+        if attempt == _MAX_SQL_RETRIES:
+            raise
+        sql_to_run = await _fix_sql(sql_to_run, question, str(exc), table_names)
+```
+
+```python
+async def _fix_sql(bad_sql, question, error, table_names) -> str:
+    # Builds a prompt with the failing SQL + error + schema,
+    # calls _llm, and returns _clean_sql(raw_correction).
+    ...
+```
+
+**Why this is better than post-processing**
+The fix is generic — it handles any SQL error the LLM produces (wrong alias, non-existent column, bad function name, etc.), not just this specific CTE alias mistake.
+
+---
+
+## #15 — `create_extraction_chain_pydantic` deprecated: table selector returns `[]`
+
+**Symptom**
+```
+2026-03-04T20:34:56 | INFO | app.agent | Tables selected: []
+```
+With no tables selected, `generate_query` received `table_names_to_use=[]`, so no schema was injected into the prompt. The LLM generated prose or schema-free SQL instead of a valid query.
+
+**Root cause**
+`create_extraction_chain_pydantic` from `langchain.chains.openai_tools` is deprecated in LangChain 0.2.x. When called against GPT-4o (which uses the newer tool-calling API), it silently returned an empty list instead of raising an error. The deprecation warning in the logs confirmed this:
+```
+LangChainDeprecationWarning: LangChain has introduced a method called
+`with_structured_output` ... with_structured_output does not currently
+support a list of pydantic schemas.
+```
+
+**Fix**
+Replaced the entire extraction chain with `llm.with_structured_output()` using a single wrapper model `_TablesResponse` that holds a `List[str]` field, avoiding the list-of-schemas limitation:
+
+```python
+# Before (deprecated)
+from operator import itemgetter
+from langchain.chains.openai_tools import create_extraction_chain_pydantic
+from langchain_core.pydantic_v1 import BaseModel, Field
+
+class Table(BaseModel):
+    name: str = Field(description="Name of table in SQL database.")
+
+_select_table = (
+    {"input": itemgetter("question")}
+    | create_extraction_chain_pydantic(Table, llm, system_message=table_details_prompt)
+    | get_tables
+)
+
+# After
+from pydantic import BaseModel, Field
+
+class _TablesResponse(BaseModel):
+    names: List[str] = Field(description="Names of ALL SQL tables that might be relevant.")
+
+_select_table = (
+    ChatPromptTemplate.from_messages([
+        ("system", table_details_prompt),
+        ("human", "Question: {question}\n\nWhich tables are needed?"),
+    ])
+    | llm.with_structured_output(_TablesResponse)
+    | (lambda r: r.names)
+)
+```
+
+Also removed the now-unused imports: `itemgetter`, `create_extraction_chain_pydantic`, `langchain_core.pydantic_v1`.
+
+---
+
+## #16 — SQL generation fails silently when table selector returns empty list
+
+**Symptom**
+When bug #15 caused `table_names = []`, `generate_query.ainvoke({"table_names_to_use": []})` passed an empty list to the DB schema lookup. The LLM received no schema at all and either returned prose or generated SQL with unresolvable ORDER BY aliases.
+
+**Root cause**
+No defensive check existed between the table selector output and the SQL generation step. An empty list is a valid Python value but semantically wrong — it means "show no table schemas", leaving the LLM to guess.
+
+**Fix**
+Added a fallback in `run_agent()`: if `select_table` returns an empty list, immediately fall back to all tables from `_db.get_usable_table_names()` and log a warning:
+
+```python
+table_names: List[str] = await select_table.ainvoke({"question": question})
+if not table_names:
+    table_names = list(_db.get_usable_table_names())
+    logger.warning("Table selector returned empty list; falling back to all tables: %s", table_names)
+```
+
+---
+
+## #17 — `with_structured_output` incompatible with `langchain_openai==0.1.8`
+
+**Symptom**
+```
+File "/app/app/agent.py", line 528, in run_agent
+    table_names: List[str] = await select_table.ainvoke({"question": question})
+  File ".../langchain_core/runnables/base.py", line 3981, in ainvoke
+    ...
+```
+The `lambda r: r.names` step in the `_select_table` chain crashed because `with_structured_output` did not return a `_TablesResponse` instance — it returned something without a `.names` attribute.
+
+**Root cause**
+`llm.with_structured_output(_TablesResponse)` behaves differently across LangChain versions. In `langchain_openai==0.1.8` + `langchain_core==0.2.5`, the return type depends on the underlying method used internally (function calling vs JSON mode). With a pydantic v2 model from the standard `pydantic` package (not `langchain_core.pydantic_v1`), the version combination returned an unexpected type rather than a model instance, causing `.names` to raise `AttributeError`.
+
+**Fix**
+Replaced the `with_structured_output` approach entirely with a plain `StrOutputParser` + string split — no pydantic, no version compatibility risk:
+
+```python
+# Before (brittle)
+from pydantic import BaseModel, Field
+
+class _TablesResponse(BaseModel):
+    names: List[str] = Field(...)
+
+_select_table = (
+    ChatPromptTemplate.from_messages([...])
+    | llm.with_structured_output(_TablesResponse)
+    | (lambda r: r.names)
+)
+
+# After (robust)
+_select_table = (
+    ChatPromptTemplate.from_messages([
+        ("system", table_details_prompt),
+        ("human",
+         "Question: {question}\n\n"
+         "Reply with ONLY a comma-separated list of table names. "
+         "Example: deliveries,matches"),
+    ])
+    | llm
+    | StrOutputParser()
+    | (lambda raw: [t.strip() for t in raw.split(",") if t.strip()])
+)
+```
+
+Also added name validation in `run_agent()` to discard hallucinated table names:
+```python
+available_tables = set(_db.get_usable_table_names())
+raw_selection = await select_table.ainvoke({"question": question})
+table_names = [t for t in raw_selection if t in available_tables]
+```

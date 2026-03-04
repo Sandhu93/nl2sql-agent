@@ -234,7 +234,207 @@ Without examples the LLM guessed column names (causing `UndefinedColumn` errors)
 
 ---
 
-## What's next — Step 4
+## Step 4 — Dynamic Few-Shot Example Selection
+
+**Tutorial:** *Dynamic Few-Shot Example Selection*
+
+**Goal:** Instead of always injecting all 8 static examples into every prompt, use vector similarity to pick only the 3 most relevant examples for each incoming question. The prompt stays compact and the examples shown to the model are always the most contextually aligned ones.
+
+### The problem with static examples
+
+In Step 3, every request sent all 8 examples regardless of the question. A question about run-scorers and a question about venue capacity both received the same 8-example prefix. This:
+- Wastes tokens on irrelevant examples
+- Dilutes the signal the model receives — the truly helpful examples are buried among unrelated ones
+- Scales poorly as the example bank grows
+
+### What changed in `agent.py`
+
+**Before:** `FewShotChatMessagePromptTemplate(examples=IPL_EXAMPLES, …)` — all 8 examples, always.
+
+**After:** `FewShotChatMessagePromptTemplate(example_selector=example_selector, …)` — at call-time, the selector embeds the question, computes cosine similarity against every stored example, and returns the 3 closest matches.
+
+### How the selector works
+
+```
+Startup (once)
+    │
+    ▼
+SemanticSimilarityExampleSelector.from_examples(
+    IPL_EXAMPLES,          ← 8 examples embedded and stored in Chroma
+    OpenAIEmbeddings(),    ← text-embedding-ada-002 via OpenAI API
+    Chroma,                ← in-memory vector store (no disk persistence needed)
+    k=3,                   ← return top 3 matches
+    input_keys=["input"],  ← embed the "input" field of each example
+)
+
+Per request
+    │
+    ▼
+selector.select_examples({"input": user_question})
+    │                      └── embeds the question → cosine similarity → top 3
+    ▼
+[example_1, example_2, example_3]   ← most relevant to this specific question
+    │
+    ▼
+Injected into the prompt as (human, ai) message pairs
+```
+
+### Key new imports
+
+```python
+from langchain_community.vectorstores import Chroma
+from langchain_core.example_selectors import SemanticSimilarityExampleSelector
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+```
+
+### Prompt structure (updated)
+
+```
+[system]  Role + {table_info} + {top_k} instruction
+[human]   Dynamically selected example question 1 \n SQLQuery:
+[ai]      SELECT …
+[human]   Dynamically selected example question 2 \n SQLQuery:
+[ai]      SELECT …
+[human]   Dynamically selected example question 3 \n SQLQuery:
+[ai]      SELECT …
+[human]   Actual user question \n SQLQuery:     ← model responds here
+```
+
+### What did NOT change
+
+- `IPL_EXAMPLES` — the 8 examples are unchanged; only how they are selected changed
+- `create_sql_query_chain(llm, _db, prompt=_build_few_shot_prompt())` — same call
+- The rest of the pipeline (SQL cleaning, multi-statement execution, rephrasing)
+- The lazy singleton pattern — `_build_few_shot_prompt()` is called once inside `_get_chain()`
+
+### Adaptation from the tutorial
+
+| Tutorial | This app |
+|---|---|
+| `Chroma()` + `vectorstore.delete_collection()` then pass instance | Pass the `Chroma` class directly to `from_examples()` — no pre-creation needed |
+| `OpenAIEmbeddings()` (uses env var) | `OpenAIEmbeddings(api_key=settings.openai_api_key)` — explicit from pydantic-settings |
+| MySQL system prompt | PostgreSQL + IPL-specific system prompt |
+| `k=2` | `k=3` — one extra example for slightly more coverage |
+| Generic employee/product examples | IPL-specific examples (batsman, bowler, deliveries, matches) |
+
+### Why this matters
+
+- **Token efficiency**: 3 examples instead of 8 means a smaller, cheaper prompt
+- **Signal quality**: the model sees only the most relevant guidance, reducing confusion
+- **Scales gracefully**: you can grow `IPL_EXAMPLES` to 50+ entries without bloating every request — the selector always filters down to `k`
+
+---
+
+## Step 5 — Dynamic Relevant Table Selection
+
+**Tutorial:** *Dynamic Relevant Table Selection*
+
+**Goal:** Before generating SQL, ask the LLM which tables are actually needed for this question. Pass only those tables' schemas to the SQL-generation prompt, keeping it compact regardless of how large the database grows.
+
+### The problem with full-schema prompts
+
+Every call to `create_sql_query_chain` injects the complete schema of every table (column names, types, sample rows) into the prompt. With 2 tables this is fine; with 100+ tables it:
+- Pushes token costs up dramatically on every request
+- Floods the model with irrelevant schema, reducing accuracy
+- Slows response time as the prompt grows
+
+### What changed
+
+**New file:** `backend/app/database_table_descriptions.csv` — one row per table with a plain-English description of what the table contains and what each key column means. The LLM reads these short descriptions (not the full schema) to decide which tables to include.
+
+**Pipeline before:**
+```
+question → generate_query(all tables) → SQL → execute → rephrase
+```
+
+**Pipeline after:**
+```
+question → select_table → [deliveries, matches]
+                │
+                ▼
+         generate_query(only those schemas) → SQL → execute → rephrase
+```
+
+### New helpers in `agent.py`
+
+```python
+_TABLE_DESCRIPTIONS_CSV = Path(__file__).parent / "database_table_descriptions.csv"
+
+def get_table_details() -> str:
+    df = pd.read_csv(_TABLE_DESCRIPTIONS_CSV)
+    # returns "Table Name: deliveries\nTable Description: …\n\nTable Name: matches\n…"
+
+class Table(BaseModel):
+    name: str = Field(description="Name of table in SQL database.")
+
+def get_tables(tables: List[Table]) -> List[str]:
+    return [table.name for table in tables]
+```
+
+### The `_select_table` chain
+
+```python
+table_details_prompt = (
+    "Return the names of ALL the SQL tables that MIGHT be relevant to the user question. "
+    f"The tables are:\n\n{get_table_details()}\n"
+    "Remember to include ALL POTENTIALLY RELEVANT tables, even if you're not sure that they're needed."
+)
+
+_select_table = (
+    {"input": itemgetter("question")}
+    | create_extraction_chain_pydantic(Table, llm, system_message=table_details_prompt)
+    | get_tables
+)
+```
+
+At call-time: `await select_table.ainvoke({"question": question})` → `["deliveries", "matches"]`
+
+### Updated `run_agent()` call sequence
+
+```python
+# Step 1 — pick relevant tables
+table_names = await select_table.ainvoke({"question": question})
+
+# Step 2 — generate SQL with only those schemas
+raw = await generate_query.ainvoke({
+    "question": question,
+    "table_names_to_use": table_names,
+})
+```
+
+`create_sql_query_chain` passes `table_names_to_use` to `db.get_table_info(table_names=…)`, which filters the schema injected into the prompt.
+
+### New imports
+
+```python
+from operator import itemgetter
+from pathlib import Path
+from typing import List
+import pandas as pd
+from langchain.chains.openai_tools import create_extraction_chain_pydantic
+from langchain_core.pydantic_v1 import BaseModel, Field
+```
+
+`pandas==2.2.2` added to `backend/requirements.txt`.
+
+### Adaptation from the tutorial
+
+| Tutorial | This app |
+|---|---|
+| Generic `customers`, `orders` tables | IPL `deliveries`, `matches` tables |
+| `pd.read_csv("database_table_descriptions.csv")` (CWD-relative) | `Path(__file__).parent / "…"` — works regardless of working directory in Docker |
+| MySQL context in descriptions | PostgreSQL + IPL-specific column descriptions |
+| Single LCEL chain (`RunnablePassthrough.assign(…)`) | Explicit `await select_table.ainvoke()` — preserves the intermediate values we need for the `{answer, sql}` response |
+
+### Why this matters
+
+- **Token efficiency**: Only the 1–2 relevant schemas are sent, not all schemas
+- **Accuracy at scale**: The model focuses on the right tables and avoids confusing column names from unrelated tables
+- **Zero code change required when adding tables**: Just add a row to `database_table_descriptions.csv` — the selector and generator adapt automatically
+
+---
+
+## What's next — Step 6
 
 Replace the single-chain pipeline with a **LangGraph `create_react_agent`** + `MemorySaver` so the agent can:
 - Hold multi-turn conversation history per `thread_id`
