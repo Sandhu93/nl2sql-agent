@@ -1,266 +1,56 @@
 """
-NL2SQL Agent — Step 6: Conversation Memory.
+NL2SQL Agent — orchestrator (Step 6: Conversation Memory).
+
+This module is the single entry point called by routes/query.py.
+It wires together the components defined in the helper modules:
+
+  sql_helpers.py      — SQL parsing and execution utilities
+  prompts.py          — IPL few-shot examples + prompt template
+  table_selector.py   — CSV-backed plain-English table descriptions
 
 Pipeline
 --------
   User question
       │
       ▼
-  select_table chain       ← LLM picks which tables are relevant to the question
+  _select_table chain      ← LLM picks which tables are relevant (table_selector)
       │
       ▼
-  create_sql_query_chain   ← LLM turns NL into SQL (only relevant tables in schema;
-                             previous conversation turns injected via MessagesPlaceholder)
+  _generate_query chain    ← LLM turns NL into SQL with dynamic few-shot examples
+                             and per-thread conversation history (prompts)
       │
       ▼
-  _clean_sql()             ← strips markdown, prose, prefixes
+  _clean_sql()             ← strips markdown, prose, prefixes (sql_helpers)
       │
       ▼
-  QuerySQLDataBaseTool     ← executes SQL (each statement separately if multiple)
+  _run_sql()               ← executes SQL, handles multi-statement (sql_helpers)
       │
       ▼
-  rephrase_answer chain    ← LLM converts raw result into a sentence
+  _rephrase_answer chain   ← (question + SQL + result) → readable sentence
       │
       ▼
-  {"answer": <natural language sentence>, "sql": <generated SQL>}
-  + history updated        ← question + answer appended to per-thread ChatMessageHistory
-
-Adaptations from the tutorial
-------------------------------
-  Tutorial                         This app
-  ──────────────────────────────── ────────────────────────────────────────
-  os.environ["OPENAI_API_KEY"]     settings.openai_api_key  (from .env)
-  mysql+pymysql://...              settings.database_url    (postgresql+psycopg2)
-  single global ChatMessageHistory per-thread dict keyed by thread_id
-  chain.invoke(...)                3 explicit ainvoke() calls — lets us
-                                   capture sql + answer separately for the
-                                   API response shape {answer, sql}
-  synchronous .invoke()            async .ainvoke()         (FastAPI async)
-  module-level db init             lazy init on first call  (survives hot-reload)
-  generic examples                 IPL-specific examples    (batsman, bowler, etc.)
-  static examples in prompt        dynamic selection via SemanticSimilarityExampleSelector
-                                   + ChromaDB + OpenAI Embeddings
-  all table schemas in prompt      dynamic table selection via extraction chain
-                                   + database_table_descriptions.csv
+  {"answer": <sentence>, "sql": <clean SQL>}
+  + history updated        ← turn appended to per-thread ChatMessageHistory
 """
 
 import logging
-import re
-from pathlib import Path
 from typing import List
 
-import pandas as pd
-
 from langchain.chains import create_sql_query_chain
+from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain_community.tools.sql_database.tool import QuerySQLDataBaseTool
 from langchain_community.utilities.sql_database import SQLDatabase
-from langchain_community.vectorstores import Chroma
-from langchain_core.example_selectors import SemanticSimilarityExampleSelector
 from langchain_core.output_parsers import StrOutputParser
-from langchain_community.chat_message_histories import ChatMessageHistory
-from langchain_core.prompts import (
-    ChatPromptTemplate,
-    FewShotChatMessagePromptTemplate,
-    MessagesPlaceholder,
-    PromptTemplate,
-)
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
+from langchain_openai import ChatOpenAI
 
 from app.config import get_settings
+from app.prompts import _build_few_shot_prompt
+from app.sql_helpers import _clean_sql, _is_sql_error, _run_sql
+from app.table_selector import get_table_details, get_table_names
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
-
-# ---------------------------------------------------------------------------
-# Dynamic table selection — helpers and Pydantic model
-# ---------------------------------------------------------------------------
-
-# Path to the CSV that describes each table in plain English.
-# Mounted into the container at /app/app/ via the backend volume.
-_TABLE_DESCRIPTIONS_CSV = Path(__file__).parent / "database_table_descriptions.csv"
-
-
-def get_table_details() -> str:
-    """
-    Read database_table_descriptions.csv and return a formatted string
-    listing every table name and its plain-English description.
-    This text is embedded in the table-selection prompt so the LLM can
-    decide which tables are relevant without seeing the full schema.
-    """
-    df = pd.read_csv(_TABLE_DESCRIPTIONS_CSV)
-    details = ""
-    for _, row in df.iterrows():
-        details += f"Table Name: {row['Table']}\nTable Description: {row['Description']}\n\n"
-    return details
-
-
-
-# ---------------------------------------------------------------------------
-# Few-shot examples — IPL-specific question/SQL pairs that steer the LLM
-# toward correct column names and PostgreSQL idioms for this dataset.
-# Add more examples here to cover query patterns that the model gets wrong.
-# ---------------------------------------------------------------------------
-
-IPL_EXAMPLES = [
-    {
-        "input": "How many runs did Virat Kohli score in total?",
-        "query": (
-            "SELECT SUM(batsman_runs) AS total_runs "
-            "FROM deliveries "
-            "WHERE batsman = 'V Kohli';"
-        ),
-    },
-    {
-        "input": "Who are the top 5 highest run-scorers across all seasons?",
-        "query": (
-            "SELECT batsman, SUM(batsman_runs) AS total_runs "
-            "FROM deliveries "
-            "GROUP BY batsman "
-            "ORDER BY total_runs DESC "
-            "LIMIT 5;"
-        ),
-    },
-    {
-        "input": "Which bowlers have taken the most wickets?",
-        "query": (
-            "SELECT bowler, COUNT(*) AS total_wickets "
-            "FROM deliveries "
-            "WHERE dismissal_kind NOT IN ('run out', 'retired hurt', 'obstructing the field') "
-            "  AND player_dismissed IS NOT NULL "
-            "GROUP BY bowler "
-            "ORDER BY total_wickets DESC "
-            "LIMIT 10;"
-        ),
-    },
-    {
-        "input": "Which team has won the most IPL titles?",
-        "query": (
-            "SELECT winner, COUNT(*) AS titles "
-            "FROM matches "
-            "WHERE match_type = 'Final' "
-            "GROUP BY winner "
-            "ORDER BY titles DESC "
-            "LIMIT 5;"
-        ),
-    },
-    {
-        "input": "Who has won the Player of the Match award the most times?",
-        "query": (
-            "SELECT player_of_match, COUNT(*) AS awards "
-            "FROM matches "
-            "WHERE player_of_match IS NOT NULL "
-            "GROUP BY player_of_match "
-            "ORDER BY awards DESC "
-            "LIMIT 10;"
-        ),
-    },
-    {
-        "input": "How many sixes were hit in the 2016 season?",
-        "query": (
-            "SELECT COUNT(*) AS total_sixes "
-            "FROM deliveries d "
-            "JOIN matches m ON d.match_id = m.id "
-            "WHERE m.season = 2016 "
-            "  AND d.batsman_runs = 6;"
-        ),
-    },
-    {
-        "input": "What is the highest individual score in a single match?",
-        "query": (
-            "SELECT batsman, match_id, SUM(batsman_runs) AS runs_in_match "
-            "FROM deliveries "
-            "GROUP BY batsman, match_id "
-            "ORDER BY runs_in_match DESC "
-            "LIMIT 1;"
-        ),
-    },
-    {
-        "input": "Which venue has hosted the most matches?",
-        "query": (
-            "SELECT venue, COUNT(*) AS matches_hosted "
-            "FROM matches "
-            "GROUP BY venue "
-            "ORDER BY matches_hosted DESC "
-            "LIMIT 5;"
-        ),
-    },
-]
-
-
-def _build_few_shot_prompt() -> ChatPromptTemplate:
-    """
-    Assemble a ChatPromptTemplate with DYNAMIC few-shot example selection.
-
-    Instead of sending all IPL_EXAMPLES on every request, a
-    SemanticSimilarityExampleSelector embeds the user's question at call-time
-    and retrieves the k=3 most semantically similar examples from a ChromaDB
-    vector store.  This keeps the prompt compact and ensures the examples
-    shown to the model are always the most relevant ones for the current query.
-
-    Prompt structure
-    ----------------
-      [system]   Role + schema (table_info) + row limit (top_k)
-      [human]    dynamically chosen example question
-      [ai]       example SQL
-      …          (k=3 examples, selected per query)
-      [human]    actual user question
-    """
-    # Template for a single example turn (question → SQL)
-    example_prompt = ChatPromptTemplate.from_messages(
-        [
-            ("human", "{input}\nSQLQuery:"),
-            ("ai", "{query}"),
-        ]
-    )
-
-    # Embed all IPL_EXAMPLES into an in-memory Chroma vector store.
-    # At query time the selector computes cosine similarity between the
-    # incoming question embedding and each stored example, then returns the
-    # k closest matches.  The vector store is rebuilt fresh each startup
-    # (no persistence needed for this small example set).
-    example_selector = SemanticSimilarityExampleSelector.from_examples(
-        IPL_EXAMPLES,
-        OpenAIEmbeddings(api_key=settings.openai_api_key),
-        Chroma,
-        k=3,
-        input_keys=["input"],
-    )
-    logger.info("Dynamic example selector built | examples=%d | k=3", len(IPL_EXAMPLES))
-
-    # Dynamic few-shot block: examples are chosen at call-time via the selector
-    few_shot_prompt = FewShotChatMessagePromptTemplate(
-        example_prompt=example_prompt,
-        example_selector=example_selector,
-        input_variables=["input", "top_k"],
-    )
-
-    # Full prompt: system context → dynamic few-shot block → conversation
-    # history → user question.
-    # MessagesPlaceholder injects the prior turns (HumanMessage / AIMessage
-    # pairs) so the model can resolve follow-up questions like "and in 2017?".
-    return ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                (
-                    "You are a PostgreSQL expert for an IPL (Indian Premier League) cricket "
-                    "database. Given an input question, write a syntactically correct "
-                    "PostgreSQL query to answer it. Unless the user specifies a different "
-                    "number of results, limit your query to at most {top_k} rows using "
-                    "LIMIT.\n\n"
-                    "Only query columns that exist in the schema below. Pay attention to "
-                    "which table each column belongs to. Wrap column and table names in "
-                    "double quotes only when they are reserved words.\n\n"
-                    "Relevant table schema:\n{table_info}\n\n"
-                    "Here are the most relevant example questions and their SQL queries:"
-                ),
-            ),
-            few_shot_prompt,
-            MessagesPlaceholder(variable_name="messages"),
-            ("human", "{input}\nSQLQuery:"),
-        ]
-    )
-
 
 # ---------------------------------------------------------------------------
 # Lazy singletons — initialised on the first request so that a missing DB
@@ -282,102 +72,6 @@ _conversation_histories: dict[str, ChatMessageHistory] = {}
 _MAX_SQL_RETRIES = 2
 
 
-# ---------------------------------------------------------------------------
-# SQL extraction helpers
-# ---------------------------------------------------------------------------
-
-def _strip_prefix_and_prose(text: str) -> str:
-    """
-    Strip a 'SQLQuery:' / 'SQL:' prefix and any leading non-SQL prose
-    from a fragment that is already expected to be mostly SQL.
-    Applied both to the full raw output (no-code-block path) and to
-    the content extracted from each individual code block.
-    """
-    text = text.strip()
-
-    # Remove known LangChain / model label prefixes
-    for prefix in ("SQLQuery:", "SQL Query:", "SQL:"):
-        if text.upper().startswith(prefix.upper()):
-            text = text[len(prefix):].strip()
-            break
-
-    # If prose still precedes the SQL, jump to the first SQL keyword
-    sql_start = re.search(
-        r"\b(SELECT|INSERT|UPDATE|DELETE|WITH|CREATE|DROP|ALTER)\b",
-        text,
-        re.IGNORECASE,
-    )
-    if sql_start:
-        text = text[sql_start.start():]
-
-    return text.strip()
-
-
-def _clean_sql(raw: str) -> str:
-    """
-    Extract pure SQL from LLM output that may contain:
-      - Markdown code fences:  ```sql ... ```  or  ``` ... ```
-      - Prefixes:              'SQLQuery:'  'SQL Query:'  'SQL:'
-      - Explanatory prose before / after the actual query
-      - MULTIPLE code blocks (e.g. one per sub-query)
-
-    Strategy:
-      1. Find ALL ```sql/``` blocks with findall (not just the first one).
-         Each block is individually cleaned of any prefix inside it.
-         All blocks are joined so _run_sql can execute them sequentially.
-      2. No code blocks → fall back to prefix stripping + keyword search
-         on the full raw text.
-    """
-    text = raw.strip()
-
-    # 1. Collect every markdown code block (```sql ... ``` or ``` ... ```)
-    #    Bug fix: re.search only returned the FIRST block; re.findall gets ALL.
-    blocks = re.findall(r"```(?:sql)?\s*([\s\S]*?)```", text, re.IGNORECASE)
-    if blocks:
-        cleaned = [_strip_prefix_and_prose(b) for b in blocks]
-        # Drop empty fragments; join with a blank line so _run_sql can split them
-        return "\n\n".join(b for b in cleaned if b)
-
-    # 2. No code fences — strip prefix / prose from the full text
-    return _strip_prefix_and_prose(text)
-
-
-def _is_sql_error(result: str) -> bool:
-    """
-    Return True if QuerySQLDataBaseTool returned a database error string.
-
-    QuerySQLDataBaseTool does NOT raise on SQL failure — it returns the
-    exception message as a plain string starting with 'Error:'.  We must
-    detect this pattern to decide whether to retry via _fix_sql().
-    """
-    return result.strip().startswith("Error:")
-
-
-async def _run_sql(execute_query: QuerySQLDataBaseTool, sql: str) -> str:
-    """
-    Execute one or more SQL statements separated by semicolons.
-    psycopg2 does not support multiple statements in a single execute() call,
-    so we split on ';', run each non-empty statement, and join the results.
-
-    SQL-line comments (-- ...) are stripped before splitting so they don't
-    accidentally appear as empty statements.
-    """
-    # Remove single-line comments
-    cleaned = re.sub(r"--[^\n]*", "", sql)
-
-    # Split on semicolons; keep only non-empty statements
-    statements = [s.strip() for s in cleaned.split(";") if s.strip()]
-
-    if len(statements) == 1:
-        return await execute_query.ainvoke(statements[0])
-
-    results = []
-    for stmt in statements:
-        res = await execute_query.ainvoke(stmt)
-        results.append(res)
-    return "\n".join(results)
-
-
 async def _fix_sql(
     bad_sql: str,
     question: str,
@@ -389,12 +83,12 @@ async def _fix_sql(
 
     Feeds the original question, the failing SQL, the database error, and the
     relevant schema back to the LLM so it can produce a corrected query.
-    Called by run_agent() inside the retry loop when _run_sql() raises.
+    Called by run_agent() inside the retry loop when _run_sql() returns an error.
 
     Args:
         bad_sql:     The SQL string that caused the error.
         question:    The original natural-language question.
-        error:       The exception message from psycopg2 / SQLDatabase.
+        error:       The error string returned by QuerySQLDataBaseTool.
         table_names: Tables selected for this query (used to filter schema).
 
     Returns:
@@ -507,10 +201,7 @@ Answer: """
         | StrOutputParser()
         | (lambda raw: [t.strip() for t in raw.split(",") if t.strip()])
     )
-    logger.info(
-        "Table selector chain built | available_tables=%s",
-        pd.read_csv(_TABLE_DESCRIPTIONS_CSV)["Table"].tolist(),
-    )
+    logger.info("Table selector chain built | available_tables=%s", get_table_names())
 
     return _generate_query, _execute_query, _rephrase_answer, _select_table
 
@@ -521,7 +212,8 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
 
     Pipeline:
         1. select_table    — LLM picks relevant tables from descriptions CSV
-        2. generate_query  — NL → raw LLM output (only relevant schemas shown)
+        2. generate_query  — NL → raw LLM output (only relevant schemas shown;
+                             conversation history injected via MessagesPlaceholder)
         3. _clean_sql()    — extract pure SQL statements
         4. _run_sql()      — execute each statement, combine results
         5. rephrase_answer — (question + SQL + result) → readable sentence
@@ -607,8 +299,6 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
     logger.info("Query result: %s", result)
 
     # Step 5 — Rephrase the raw DB result into a natural language answer.
-    # TODO: In Step 6, this answer will come from the LangGraph agent's final
-    #       message instead, removing the need for a separate rephrase chain.
     answer: str = await rephrase_answer.ainvoke({
         "question": question,
         "query": sql,
