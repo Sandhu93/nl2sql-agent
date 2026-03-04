@@ -434,9 +434,95 @@ from langchain_core.pydantic_v1 import BaseModel, Field
 
 ---
 
-## What's next — Step 6
+---
 
-Replace the single-chain pipeline with a **LangGraph `create_react_agent`** + `MemorySaver` so the agent can:
-- Hold multi-turn conversation history per `thread_id`
-- Use the `SQLDatabaseToolkit` as a proper tool set (schema inspection + query execution)
-- Return the final answer from the agent's last message rather than a separate rephrase chain
+## Step 6 — Conversation Memory
+
+**Tutorial:** *Adding Memory to NL2SQL*
+
+**Goal:** Let the agent remember what was discussed earlier in the same chat session so follow-up questions like *"and what about in 2017?"* or *"who was the runner-up?"* resolve correctly.
+
+### What changed in `agent.py`
+
+**Before:** `run_agent()` treated every call independently — `thread_id` was accepted but never used.
+
+**After:** a `ChatMessageHistory` is stored per `thread_id`, and the full history is injected into the SQL-generation prompt on every turn via a `MessagesPlaceholder`.
+
+```
+Startup
+    │
+    ▼
+_conversation_histories: dict[str, ChatMessageHistory] = {}   ← module-level store
+
+Per request
+    │
+    ├─ look up (or create) history for thread_id
+    │
+    ├─ Step 2: generate_query.ainvoke({
+    │       "question": question,
+    │       "table_names_to_use": table_names,
+    │       "messages": history.messages,      ← NEW: prior turns injected here
+    │   })
+    │
+    └─ after answer:
+           history.add_user_message(question)  ← NEW: record this turn
+           history.add_ai_message(answer)
+```
+
+### Prompt structure (updated)
+
+```
+[system]   Role + {table_info} + {top_k} instruction
+[human]    Dynamically selected example question 1 \n SQLQuery:
+[ai]       SELECT …
+[human]    Dynamically selected example question 2 \n SQLQuery:
+[ai]       SELECT …
+[human]    Dynamically selected example question 3 \n SQLQuery:
+[ai]       SELECT …
+[human]    Turn 1 question (from history)        ← NEW via MessagesPlaceholder
+[ai]       Turn 1 answer   (from history)        ← NEW
+… (all prior turns)
+[human]    Actual user question \n SQLQuery:     ← model responds here
+```
+
+### Key additions
+
+```python
+from langchain_community.chat_message_histories import ChatMessageHistory
+from langchain_core.prompts import MessagesPlaceholder   # added to existing import
+
+# Module-level in-memory store — keyed by thread_id
+_conversation_histories: dict[str, ChatMessageHistory] = {}
+```
+
+`MessagesPlaceholder` inserted into `_build_few_shot_prompt()`:
+
+```python
+return ChatPromptTemplate.from_messages([
+    ("system", "..."),
+    few_shot_prompt,
+    MessagesPlaceholder(variable_name="messages"),   # ← NEW
+    ("human", "{input}\nSQLQuery:"),
+])
+```
+
+### Adaptation from the tutorial
+
+| Tutorial | This app |
+|---|---|
+| Single global `history = ChatMessageHistory()` | `_conversation_histories[thread_id]` — one history per session |
+| `chain.invoke({"question": …, "messages": history.messages})` | `generate_query.ainvoke({"question": …, "messages": …, "table_names_to_use": …})` |
+| `history.add_user_message` / `add_ai_message` called once | Same, called after the rephrase step so the stored answer is human-readable |
+| Single-chain pipeline | Same 5-step pipeline with history wired into Step 2 only |
+
+### Why `messages` is passed only to `generate_query`, not `rephrase_answer`
+
+The conversation history is only useful for *generating the correct SQL* — so the model can refer back to prior context when the user asks a follow-up. The `rephrase_answer` chain just converts the raw DB result into a sentence; it doesn't need history to do that.
+
+### What does NOT change
+
+- `IPL_EXAMPLES` and the dynamic example selector — unchanged
+- The table selection step — unchanged
+- `_clean_sql`, `_run_sql`, `_fix_sql`, retry loop — unchanged
+- The API response shape `{answer, sql}` — unchanged
+- `thread_id` was already wired through from `routes/query.py` and the frontend — it just wasn't used until now

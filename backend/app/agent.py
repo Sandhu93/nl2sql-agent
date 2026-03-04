@@ -1,5 +1,5 @@
 """
-NL2SQL Agent — Step 5: Dynamic Relevant Table Selection.
+NL2SQL Agent — Step 6: Conversation Memory.
 
 Pipeline
 --------
@@ -9,7 +9,8 @@ Pipeline
   select_table chain       ← LLM picks which tables are relevant to the question
       │
       ▼
-  create_sql_query_chain   ← LLM turns NL into SQL (only relevant tables in schema)
+  create_sql_query_chain   ← LLM turns NL into SQL (only relevant tables in schema;
+                             previous conversation turns injected via MessagesPlaceholder)
       │
       ▼
   _clean_sql()             ← strips markdown, prose, prefixes
@@ -22,6 +23,7 @@ Pipeline
       │
       ▼
   {"answer": <natural language sentence>, "sql": <generated SQL>}
+  + history updated        ← question + answer appended to per-thread ChatMessageHistory
 
 Adaptations from the tutorial
 ------------------------------
@@ -29,6 +31,7 @@ Adaptations from the tutorial
   ──────────────────────────────── ────────────────────────────────────────
   os.environ["OPENAI_API_KEY"]     settings.openai_api_key  (from .env)
   mysql+pymysql://...              settings.database_url    (postgresql+psycopg2)
+  single global ChatMessageHistory per-thread dict keyed by thread_id
   chain.invoke(...)                3 explicit ainvoke() calls — lets us
                                    capture sql + answer separately for the
                                    API response shape {answer, sql}
@@ -39,11 +42,6 @@ Adaptations from the tutorial
                                    + ChromaDB + OpenAI Embeddings
   all table schemas in prompt      dynamic table selection via extraction chain
                                    + database_table_descriptions.csv
-
-TODO (next tutorial steps)
---------------------------
-  Step 6 – Replace with LangGraph create_react_agent + MemorySaver for
-           multi-turn conversation history (thread_id will be used there).
 """
 
 import logging
@@ -59,9 +57,11 @@ from langchain_community.utilities.sql_database import SQLDatabase
 from langchain_community.vectorstores import Chroma
 from langchain_core.example_selectors import SemanticSimilarityExampleSelector
 from langchain_core.output_parsers import StrOutputParser
+from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain_core.prompts import (
     ChatPromptTemplate,
     FewShotChatMessagePromptTemplate,
+    MessagesPlaceholder,
     PromptTemplate,
 )
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
@@ -234,7 +234,10 @@ def _build_few_shot_prompt() -> ChatPromptTemplate:
         input_variables=["input", "top_k"],
     )
 
-    # Full prompt: system context → dynamic few-shot block → user question
+    # Full prompt: system context → dynamic few-shot block → conversation
+    # history → user question.
+    # MessagesPlaceholder injects the prior turns (HumanMessage / AIMessage
+    # pairs) so the model can resolve follow-up questions like "and in 2017?".
     return ChatPromptTemplate.from_messages(
         [
             (
@@ -253,6 +256,7 @@ def _build_few_shot_prompt() -> ChatPromptTemplate:
                 ),
             ),
             few_shot_prompt,
+            MessagesPlaceholder(variable_name="messages"),
             ("human", "{input}\nSQLQuery:"),
         ]
     )
@@ -269,6 +273,10 @@ _generate_query = None
 _execute_query: QuerySQLDataBaseTool | None = None
 _rephrase_answer = None
 _select_table = None  # chain: {"question": str} → List[str] of relevant table names
+
+# Per-thread conversation history (in-memory, lost on restart).
+# Keyed by thread_id so each browser session has its own message history.
+_conversation_histories: dict[str, ChatMessageHistory] = {}
 
 # Maximum number of LLM-driven correction attempts after a SQL execution error.
 _MAX_SQL_RETRIES = 2
@@ -520,8 +528,9 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
 
     Args:
         question:  Natural-language question from the user.
-        thread_id: Session identifier — unused in the basic model.
-                   Will drive LangGraph's per-thread memory in Step 4.
+        thread_id: Session identifier — used to look up / create the
+                   per-thread ChatMessageHistory so follow-up questions
+                   can reference earlier answers in the same session.
 
     Returns:
         {"answer": <natural language sentence>, "sql": <clean SQL>}
@@ -529,6 +538,14 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
     logger.info("run_agent | thread_id=%s | question=%r", thread_id, question)
 
     generate_query, execute_query, rephrase_answer, select_table = _get_chain()
+
+    # Retrieve (or create) the conversation history for this session.
+    # history.messages is [] on the first turn, which is fine — the
+    # MessagesPlaceholder simply adds nothing to the prompt.
+    if thread_id not in _conversation_histories:
+        _conversation_histories[thread_id] = ChatMessageHistory()
+        logger.info("New conversation history created | thread_id=%s", thread_id)
+    history = _conversation_histories[thread_id]
 
     # Step 1 — Identify which tables are relevant to this question.
     # The selector reads plain-English table descriptions and asks the LLM to
@@ -545,9 +562,13 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
     logger.info("Tables selected: %s", table_names)
 
     # Step 2 — Generate SQL using only the selected tables' schemas.
+    # history.messages injects prior (HumanMessage, AIMessage) turns into the
+    # MessagesPlaceholder so the model can resolve follow-up references like
+    # "and what about in 2017?" or "who was the runner-up?".
     raw: str = await generate_query.ainvoke({
         "question": question,
         "table_names_to_use": table_names,
+        "messages": history.messages,
     })
     logger.info("Raw LLM output: %s", raw)
 
@@ -594,5 +615,15 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
         "result": result,
     })
     logger.info("Rephrased answer: %s", answer)
+
+    # Update conversation history so the next turn in this session can
+    # reference what was asked and answered here.
+    history.add_user_message(question)
+    history.add_ai_message(answer)
+    logger.info(
+        "History updated | thread_id=%s | turns=%d",
+        thread_id,
+        len(history.messages) // 2,
+    )
 
     return {"answer": answer, "sql": sql}
