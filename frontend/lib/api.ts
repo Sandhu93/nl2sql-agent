@@ -26,7 +26,12 @@ export interface QueryResponse {
 export async function queryAgent(payload: QueryRequest): Promise<QueryResponse> {
   const res = await fetch(`${BACKEND_URL}/api/query`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      // Bypass the ngrok browser-warning interstitial page for API calls.
+      // Safe to include even when not using ngrok; ignored by other servers.
+      "ngrok-skip-browser-warning": "true",
+    },
     body: JSON.stringify(payload),
   });
 

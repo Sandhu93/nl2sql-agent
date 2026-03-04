@@ -13,8 +13,11 @@ WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 
-# TODO: Set NEXT_PUBLIC_BACKEND_URL at build time for a static export.
-#       For server-rendered pages it can be set at runtime via the .env file.
+# NEXT_PUBLIC_* vars are inlined into the client-side JS bundle at build time.
+# Pass the backend URL as a build arg so it is correct for whatever environment
+# the image is built for (local, ngrok, production).
+ARG NEXT_PUBLIC_BACKEND_URL=http://localhost:8086
+ENV NEXT_PUBLIC_BACKEND_URL=${NEXT_PUBLIC_BACKEND_URL}
 ENV NEXT_TELEMETRY_DISABLED=1
 RUN npm run build
 

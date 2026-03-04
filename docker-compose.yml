@@ -28,8 +28,7 @@ services:
     env_file:
       - .env
     environment:
-      # Explicit overrides — values from .env take lower precedence than these.
-      # TODO: Adjust ALLOWED_ORIGINS if you deploy the frontend to a real domain.
+      # TODO: Add the ngrok/production frontend URL here if the frontend is also exposed externally.
       - ALLOWED_ORIGINS=["http://localhost:8085"]
       - DB_PORT=5432
     volumes:
@@ -52,15 +51,19 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      args:
+        # Baked into the client-side JS bundle at build time.
+        # TODO: Update when the ngrok backend URL changes.
+        NEXT_PUBLIC_BACKEND_URL: https://unsugared-tameka-dally.ngrok-free.dev
     container_name: nl2sql_frontend
     ports:
       - "8085:8085"
     env_file:
       - .env
     environment:
-      # Expose the backend URL to client-side code.
-      # TODO: Change to the backend's public URL when deploying beyond localhost.
-      - NEXT_PUBLIC_BACKEND_URL=http://localhost:8086
+      # Runtime fallback (server-side rendering only). Client-side bundle uses
+      # the value baked in at build time via the build arg above.
+      - NEXT_PUBLIC_BACKEND_URL=https://unsugared-tameka-dally.ngrok-free.dev
     networks:
       - app_net
     depends_on:

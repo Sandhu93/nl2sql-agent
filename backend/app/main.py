@@ -43,7 +43,7 @@ app.add_middleware(
     allow_origins=settings.allowed_origins,
     allow_credentials=True,
     allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type", "Authorization"],
+    allow_headers=["Content-Type", "Authorization", "ngrok-skip-browser-warning"],
 )
 
 # ---------------------------------------------------------------------------

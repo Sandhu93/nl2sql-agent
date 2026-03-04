@@ -6,6 +6,7 @@ pydantic==2.7.1
 
 # LangChain / LangGraph stack
 langchain==0.2.1
+langchain-core==0.2.5
 langchain-community==0.2.1
 langchain-openai==0.1.8
 langgraph==0.1.1
