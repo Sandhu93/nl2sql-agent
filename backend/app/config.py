@@ -11,8 +11,19 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # OpenAI
+    # OpenAI — primary LLM (required)
     openai_api_key: str = Field(..., description="OpenAI API key")
+
+    # Fallback LLM providers — all optional.
+    # Add the API key for any provider you want to use as a fallback.
+    # The backend will automatically include them in the fallback chain.
+    anthropic_api_key: str | None = Field(default=None, description="Anthropic API key (Claude)")
+    google_api_key: str | None = Field(default=None, description="Google API key (Gemini)")
+    deepseek_api_key: str | None = Field(default=None, description="DeepSeek API key")
+
+    # Ollama — local LLMs, no API key needed, just a running Ollama instance.
+    ollama_base_url: str | None = Field(default=None, description="Ollama base URL, e.g. http://localhost:11434")
+    ollama_model: str = Field(default="llama3.1", description="Ollama model name to use")
 
     # PostgreSQL database
     db_user: str = Field(..., description="Database username")

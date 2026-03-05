@@ -52,6 +52,99 @@ from app.table_selector import get_table_details, get_table_names
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
+
+def _build_llm_with_fallbacks() -> ChatOpenAI:
+    """
+    Build the primary LLM (GPT-4o) and attach any configured fallback providers.
+
+    Fallbacks are tried in order when the primary raises an exception (e.g. rate
+    limit, network error, quota exceeded).  Each provider is only added when its
+    API key / URL is present in settings AND its package is installed — a missing
+    package logs a warning and is skipped rather than crashing the app.
+
+    Fallback order (when all configured):
+        1. Anthropic Claude  — strong SQL reasoning, reliable API
+        2. Google Gemini     — good general-purpose fallback
+        3. DeepSeek          — cheap, OpenAI-compatible API
+        4. Ollama            — local, no cost, quality depends on model size
+    """
+    primary = ChatOpenAI(
+        model="gpt-4o",
+        temperature=0,
+        api_key=settings.openai_api_key,
+    )
+
+    fallbacks = []
+
+    if settings.anthropic_api_key:
+        try:
+            from langchain_anthropic import ChatAnthropic  # pip install langchain-anthropic
+            fallbacks.append(
+                ChatAnthropic(
+                    model="claude-3-5-sonnet-20241022",
+                    temperature=0,
+                    api_key=settings.anthropic_api_key,
+                )
+            )
+            logger.info("Fallback LLM registered: Anthropic Claude")
+        except ImportError:
+            logger.warning(
+                "ANTHROPIC_API_KEY is set but langchain-anthropic is not installed. "
+                "Run: pip install langchain-anthropic"
+            )
+
+    if settings.google_api_key:
+        try:
+            from langchain_google_genai import ChatGoogleGenerativeAI  # pip install langchain-google-genai
+            fallbacks.append(
+                ChatGoogleGenerativeAI(
+                    model="gemini-1.5-pro",
+                    temperature=0,
+                    google_api_key=settings.google_api_key,
+                )
+            )
+            logger.info("Fallback LLM registered: Google Gemini")
+        except ImportError:
+            logger.warning(
+                "GOOGLE_API_KEY is set but langchain-google-genai is not installed. "
+                "Run: pip install langchain-google-genai"
+            )
+
+    if settings.deepseek_api_key:
+        # DeepSeek uses an OpenAI-compatible API — no extra package needed.
+        fallbacks.append(
+            ChatOpenAI(
+                model="deepseek-chat",
+                temperature=0,
+                api_key=settings.deepseek_api_key,
+                base_url="https://api.deepseek.com/v1",
+            )
+        )
+        logger.info("Fallback LLM registered: DeepSeek")
+
+    if settings.ollama_base_url:
+        try:
+            from langchain_ollama import ChatOllama  # pip install langchain-ollama
+            fallbacks.append(
+                ChatOllama(
+                    model=settings.ollama_model,
+                    base_url=settings.ollama_base_url,
+                )
+            )
+            logger.info("Fallback LLM registered: Ollama (%s)", settings.ollama_model)
+        except ImportError:
+            logger.warning(
+                "OLLAMA_BASE_URL is set but langchain-ollama is not installed. "
+                "Run: pip install langchain-ollama"
+            )
+
+    if not fallbacks:
+        logger.info("No fallback LLMs configured — using GPT-4o only")
+        return primary
+
+    logger.info("LLM fallback chain: GPT-4o → %d fallback(s) active", len(fallbacks))
+    return primary.with_fallbacks(fallbacks)
+
 # ---------------------------------------------------------------------------
 # Lazy singletons — initialised on the first request so that a missing DB
 # or bad API key surfaces as a clear runtime error, not a startup crash.
@@ -147,14 +240,10 @@ def _get_chain():
     logger.info("Connected to database | dialect=%s | tables=%s",
                 _db.dialect, _db.get_usable_table_names())
 
-    # --- LLM ---
-    # gpt-4o has significantly better SQL reasoning than gpt-3.5-turbo:
-    # correctly handles aliases in ORDER BY, subqueries, window functions, etc.
-    _llm = ChatOpenAI(
-        model="gpt-4o",
-        temperature=0,
-        api_key=settings.openai_api_key,
-    )
+    # --- LLM (primary + fallbacks) ---
+    # GPT-4o is primary. Any configured fallback providers are chained via
+    # .with_fallbacks() so the agent retries them automatically on API errors.
+    _llm = _build_llm_with_fallbacks()
     llm = _llm  # local alias for readability within this function
 
     # --- Chain: natural language → SQL string (with few-shot examples) ---

@@ -11,6 +11,13 @@ langchain-community==0.2.1
 langchain-openai==0.1.8
 langgraph==0.1.1
 
+# Optional fallback LLM providers — uncomment whichever you want to use.
+# Each package is only needed if you set the corresponding key in .env.
+# langchain-anthropic==0.1.23      # Claude  — set ANTHROPIC_API_KEY
+langchain-google-genai==1.0.6    # Gemini  — set GOOGLE_API_KEY
+# langchain-ollama==0.1.3          # Ollama  — set OLLAMA_BASE_URL (no key needed)
+# DeepSeek reuses langchain-openai — no extra package, just set DEEPSEEK_API_KEY
+
 # Database
 psycopg2-binary==2.9.9
 pandas==2.2.2

@@ -28,9 +28,6 @@ export async function queryAgent(payload: QueryRequest): Promise<QueryResponse> 
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      // Bypass the ngrok browser-warning interstitial page for API calls.
-      // Safe to include even when not using ngrok; ignored by other servers.
-      "ngrok-skip-browser-warning": "true",
     },
     body: JSON.stringify(payload),
   });
