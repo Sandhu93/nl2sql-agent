@@ -526,3 +526,122 @@ The conversation history is only useful for *generating the correct SQL* — so 
 - `_clean_sql`, `_run_sql`, `_fix_sql`, retry loop — unchanged
 - The API response shape `{answer, sql}` — unchanged
 - `thread_id` was already wired through from `routes/query.py` and the frontend — it just wasn't used until now
+
+---
+
+## Aarti's Recommendation 1 — Query Rewriting for Follow-up Questions
+
+**Recommended by:** Aarti
+**Implemented after:** Step 6 (Conversation Memory)
+
+**Goal:** Make follow-up questions reliable by rewriting them into fully standalone, self-contained questions before any other processing step runs.
+
+### The problem it solves
+
+After Step 6, conversation history is injected into the SQL-generation prompt via `MessagesPlaceholder`. This means the SQL generator *can* resolve references like "What about 2020?" — but only because the LLM happens to see the history when generating SQL. The **table-selector** (Step 1) has no such awareness: it receives only the raw follow-up question with no history context.
+
+Consider this conversation:
+
+```
+Turn 1: "Which teams won more than 5 matches in IPL 2019?"
+Turn 2: "What about in 2020?"             ← table-selector sees only this
+Turn 3: "Show me their top run scorers"   ← completely opaque without context
+```
+
+When Turn 2 hits `select_table`, it asks the LLM to pick tables from the phrase "What about in 2020?" alone. The LLM cannot reliably determine what's being asked and may return wrong tables or nothing at all — causing the fallback to all tables, which defeats the purpose of dynamic table selection entirely.
+
+### What query rewriting does
+
+A **Step 0** was added at the very beginning of `run_agent()`, before the table-selector runs. It calls an LLM with the conversation history and the follow-up question, and asks it to produce a fully standalone rewrite:
+
+```
+"What about in 2020?"  +  history  →  "Which teams won more than 5 matches in IPL 2020?"
+"Show me their top run scorers"    →  "Who were the top run scorers for the teams that won more than 5 matches in IPL 2020?"
+```
+
+This `standalone_question` then replaces `question` in every downstream step: table selection, SQL generation, SQL error correction, and the rephrase-answer step. The original `question` is kept only for storing to history, so the conversation log reflects what the user actually typed.
+
+On the first turn (empty history) the LLM call is skipped entirely — there is nothing to resolve, so we save the round-trip.
+
+### Updated pipeline
+
+```
+User question (original)
+    │
+    ▼
+Step 0: query rewrite            ← LLM rewrites follow-up → standalone_question
+    │                              (skipped on first turn when history is empty)
+    ▼
+Step 1: select_table             ← receives standalone_question (unambiguous)
+    │
+    ▼
+Step 2: generate_query           ← receives standalone_question + history
+    │
+    ▼
+Step 3: _clean_sql()
+    │
+    ▼
+Step 4: _run_sql() / _fix_sql()  ← _fix_sql also receives standalone_question
+    │
+    ▼
+Step 5: rephrase_answer          ← receives standalone_question
+    │
+    ▼
+{"answer": …, "sql": …}
+history updated with original question + answer
+```
+
+### Key additions to `agent.py`
+
+New import:
+
+```python
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder, PromptTemplate
+```
+
+Step 0 added at the top of `run_agent()`:
+
+```python
+if history.messages:
+    _rewrite_prompt = ChatPromptTemplate.from_messages([
+        (
+            "system",
+            "Given a conversation history and a follow-up question, rewrite the "
+            "follow-up as a fully standalone question that includes all necessary "
+            "context from the history. If the question is already self-contained, "
+            "return it unchanged. Return ONLY the rewritten question — no explanation, "
+            "no markdown, no extra punctuation.",
+        ),
+        MessagesPlaceholder(variable_name="history"),
+        ("human", "{question}"),
+    ])
+    _rewrite_chain = _rewrite_prompt | _llm | StrOutputParser()
+    standalone_question: str = await _rewrite_chain.ainvoke({
+        "history": history.messages,
+        "question": question,
+    })
+else:
+    standalone_question = question  # first turn — nothing to resolve
+```
+
+### What does NOT change
+
+- `IPL_EXAMPLES`, the dynamic example selector, the few-shot prompt — unchanged
+- `_select_table` chain itself — unchanged; it just now receives a better question
+- `_clean_sql`, `_run_sql`, retry loop — unchanged
+- History storage — still uses the original `question`, not the rewritten form
+- The API response shape `{answer, sql}` — unchanged
+
+### Why history stores the original question, not the rewritten one
+
+The rewrite is an internal implementation detail. If the user typed "What about 2020?" and we stored "Which teams won more than 5 matches in IPL 2020?" in history, subsequent turns would see a mismatched history that looks like the user typed verbose questions they never asked. Storing the original keeps the conversation log honest and lets the rewriter do its job correctly on the next turn too.
+
+### Why this is better than relying on the SQL generator's history alone
+
+| Concern | Without query rewriting | With query rewriting |
+|---|---|---|
+| Table selector accuracy | Fails on ambiguous follow-ups | Always receives a full question |
+| SQL generation | Usually works (sees history) | Unambiguous input, more reliable |
+| `_fix_sql` error correction | May correct using ambiguous question | Uses the resolved question |
+| Log readability | Ambiguous phrases in logs | Full questions in every log line |
+| Scales to more steps | Each new step needs its own history wiring | One rewrite serves all steps |

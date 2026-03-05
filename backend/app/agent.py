@@ -13,6 +13,9 @@ Pipeline
   User question
       │
       ▼
+  query rewrite            ← rewrite follow-ups into standalone questions
+      │                      (skipped on first turn when history is empty)
+      ▼
   _select_table chain      ← LLM picks which tables are relevant (table_selector)
       │
       ▼
@@ -26,11 +29,11 @@ Pipeline
   _run_sql()               ← executes SQL, handles multi-statement (sql_helpers)
       │
       ▼
-  _rephrase_answer chain   ← (question + SQL + result) → readable sentence
+  _rephrase_answer chain   ← (standalone question + SQL + result) → readable sentence
       │
       ▼
   {"answer": <sentence>, "sql": <clean SQL>}
-  + history updated        ← turn appended to per-thread ChatMessageHistory
+  + history updated        ← original question + answer stored per-thread
 """
 
 import logging
@@ -41,7 +44,7 @@ from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain_community.tools.sql_database.tool import QuerySQLDataBaseTool
 from langchain_community.utilities.sql_database import SQLDatabase
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import ChatPromptTemplate, PromptTemplate
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder, PromptTemplate
 from langchain_openai import ChatOpenAI
 
 from app.config import get_settings
@@ -300,6 +303,8 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
     Execute the NL2SQL pipeline with natural-language rephrasing.
 
     Pipeline:
+        0. query_rewrite   — rewrite ambiguous follow-ups into standalone questions
+                             (skipped on the first turn when history is empty)
         1. select_table    — LLM picks relevant tables from descriptions CSV
         2. generate_query  — NL → raw LLM output (only relevant schemas shown;
                              conversation history injected via MessagesPlaceholder)
@@ -328,13 +333,47 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
         logger.info("New conversation history created | thread_id=%s", thread_id)
     history = _conversation_histories[thread_id]
 
+    # Step 0 — Rewrite follow-up questions into fully standalone queries.
+    # The table-selector (Step 1) has no access to conversation history, so an
+    # ambiguous follow-up like "What about 2020?" or "Show me their top scorers"
+    # would cause it to pick wrong tables or nothing at all.  By rewriting the
+    # question into a self-contained form first, every downstream step receives
+    # an unambiguous question without needing to be aware of the history.
+    #
+    # On the first turn (empty history) we skip the LLM call entirely — there
+    # is nothing to resolve and we save one round-trip.
+    if history.messages:
+        _rewrite_prompt = ChatPromptTemplate.from_messages([
+            (
+                "system",
+                "Given a conversation history and a follow-up question, rewrite the "
+                "follow-up as a fully standalone question that includes all necessary "
+                "context from the history. If the question is already self-contained, "
+                "return it unchanged. Return ONLY the rewritten question — no explanation, "
+                "no markdown, no extra punctuation.",
+            ),
+            MessagesPlaceholder(variable_name="history"),
+            ("human", "{question}"),
+        ])
+        _rewrite_chain = _rewrite_prompt | _llm | StrOutputParser()
+        standalone_question: str = await _rewrite_chain.ainvoke({
+            "history": history.messages,
+            "question": question,
+        })
+        logger.info(
+            "Query rewrite | original=%r | standalone=%r",
+            question, standalone_question,
+        )
+    else:
+        standalone_question = question  # first turn — nothing to resolve
+
     # Step 1 — Identify which tables are relevant to this question.
     # The selector reads plain-English table descriptions and asks the LLM to
     # pick only the tables needed, so the SQL-generation prompt is focused.
     # Fallback to all available tables if the selector returns nothing so that
     # SQL generation always has a schema to work with.
     available_tables = set(_db.get_usable_table_names())
-    raw_selection: List[str] = await select_table.ainvoke({"question": question})
+    raw_selection: List[str] = await select_table.ainvoke({"question": standalone_question})
     # Discard hallucinated names; keep only tables that actually exist in the DB.
     table_names = [t for t in raw_selection if t in available_tables]
     if not table_names:
@@ -347,7 +386,7 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
     # MessagesPlaceholder so the model can resolve follow-up references like
     # "and what about in 2017?" or "who was the runner-up?".
     raw: str = await generate_query.ainvoke({
-        "question": question,
+        "question": standalone_question,
         "table_names_to_use": table_names,
         "messages": history.messages,
     })
@@ -383,7 +422,7 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
             "SQL execution failed (attempt %d/%d): %s",
             attempt + 1, 1 + _MAX_SQL_RETRIES, result,
         )
-        sql_to_run = await _fix_sql(sql_to_run, question, result, table_names)
+        sql_to_run = await _fix_sql(sql_to_run, standalone_question, result, table_names)
         logger.info("Corrected SQL (attempt %d): %s", attempt + 2, sql_to_run)
     logger.info("Query result: %s", result)
 
@@ -410,7 +449,7 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
         return {"answer": answer, "sql": sql}
 
     answer: str = await rephrase_answer.ainvoke({
-        "question": question,
+        "question": standalone_question,
         "query": sql,
         "result": result,
     })
