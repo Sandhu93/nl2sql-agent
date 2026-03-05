@@ -77,6 +77,58 @@ def _is_sql_error(result: str) -> bool:
     return result.strip().startswith("Error:")
 
 
+# ---------------------------------------------------------------------------
+# SQL output validation — called after _clean_sql(), before execution.
+# Ensures the LLM can never produce a destructive or system-level statement
+# regardless of what was injected into the prompt.
+# ---------------------------------------------------------------------------
+
+_ALLOWED_SQL_START = re.compile(r"^\s*(SELECT|WITH)\b", re.IGNORECASE)
+_FORBIDDEN_SQL_KEYWORDS = re.compile(
+    r"\b(DROP|DELETE|TRUNCATE|UPDATE|INSERT|ALTER|CREATE|GRANT|REVOKE|COPY|EXECUTE)\b",
+    re.IGNORECASE,
+)
+_SYSTEM_TABLE_ACCESS = re.compile(
+    r"\b(pg_[a-z_]+|information_schema)\b",
+    re.IGNORECASE,
+)
+
+
+def validate_sql(sql: str) -> None:
+    """
+    Reject any SQL that is not a read-only SELECT/WITH query.
+
+    This is a defence-in-depth check: even if a prompt-injection or
+    model hallucination causes the LLM to emit a destructive statement,
+    it will be blocked here before it ever reaches the database.
+
+    Args:
+        sql: Cleaned SQL string produced by _clean_sql().
+
+    Raises:
+        ValueError: With a user-safe message if the SQL is disallowed.
+                    The blocked SQL is logged server-side for audit.
+    """
+    import logging
+    _logger = logging.getLogger(__name__)
+
+    if not _ALLOWED_SQL_START.match(sql):
+        _logger.warning("SQL blocked: does not start with SELECT/WITH | sql=%r", sql[:120])
+        raise ValueError("Only read-only SELECT queries are supported.")
+
+    if _FORBIDDEN_SQL_KEYWORDS.search(sql):
+        match = _FORBIDDEN_SQL_KEYWORDS.search(sql)
+        _logger.warning(
+            "SQL blocked: forbidden keyword %r | sql=%r",
+            match.group(0) if match else "?", sql[:120],
+        )
+        raise ValueError("Only read-only SELECT queries are supported.")
+
+    if _SYSTEM_TABLE_ACCESS.search(sql):
+        _logger.warning("SQL blocked: system table access | sql=%r", sql[:120])
+        raise ValueError("Only read-only SELECT queries are supported.")
+
+
 async def _run_sql(execute_query: QuerySQLDataBaseTool, sql: str) -> str:
     """
     Execute one or more SQL statements separated by semicolons.

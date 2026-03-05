@@ -49,7 +49,7 @@ from langchain_openai import ChatOpenAI
 
 from app.config import get_settings
 from app.prompts import _build_few_shot_prompt
-from app.sql_helpers import _clean_sql, _is_sql_error, _run_sql
+from app.sql_helpers import _clean_sql, _is_sql_error, _run_sql, validate_sql
 from app.table_selector import get_table_details, get_table_names
 
 logger = logging.getLogger(__name__)
@@ -159,6 +159,7 @@ _generate_query = None
 _execute_query: QuerySQLDataBaseTool | None = None
 _rephrase_answer = None
 _select_table = None  # chain: {"question": str} → List[str] of relevant table names
+_rewrite_query = None  # chain: {"history": list, "question": str} → standalone question str
 
 # Per-thread conversation history (in-memory, lost on restart).
 # Keyed by thread_id so each browser session has its own message history.
@@ -225,11 +226,11 @@ async def _fix_sql(
 
 
 def _get_chain():
-    """Return (generate_query, execute_query, rephrase_answer, select_table), initialising them once."""
-    global _db, _llm, _generate_query, _execute_query, _rephrase_answer, _select_table
+    """Return (generate_query, execute_query, rephrase_answer, select_table, rewrite_query), initialising them once."""
+    global _db, _llm, _generate_query, _execute_query, _rephrase_answer, _select_table, _rewrite_query
 
     if _generate_query is not None:
-        return _generate_query, _execute_query, _rephrase_answer, _select_table
+        return _generate_query, _execute_query, _rephrase_answer, _select_table, _rewrite_query
 
     # --- Database connection ---
     # sample_rows_in_table_info: sends N real rows per table in the prompt so
@@ -257,7 +258,14 @@ def _get_chain():
 
     # --- Chain: (question + SQL + raw result) → natural language answer ---
     answer_prompt = PromptTemplate.from_template(
-        """Given the following user question, corresponding SQL query, and SQL result, answer the user question.
+        """You are given a user question, the SQL query that was run, and the SQL result rows.
+Your job is to write a clear, concise natural-language answer based ONLY on the SQL result.
+
+RULES:
+1. Present the data from the SQL result as the answer — do NOT question whether the query is correct.
+2. Do NOT critique, analyse, or explain the SQL.
+3. Do NOT say the answer "cannot be determined" if data is present — use what the result gives you.
+4. If the result is a list of rows, present them clearly (e.g. as bullet points or a ranked list).
 
 Question: {question}
 SQL Query: {query}
@@ -295,7 +303,40 @@ Answer: """
     )
     logger.info("Table selector chain built | available_tables=%s", get_table_names())
 
-    return _generate_query, _execute_query, _rephrase_answer, _select_table
+    # --- Chain: (history + question) → standalone question string ---
+    # Rewrites ambiguous follow-up questions into fully self-contained questions
+    # so every downstream step (table selector, SQL generator, fix_sql, rephrase)
+    # receives an unambiguous question without needing history awareness itself.
+    _rewrite_query = (
+        ChatPromptTemplate.from_messages([
+            (
+                "system",
+                "You are a question-rewriting assistant. Your ONLY job is to rewrite "
+                "a follow-up question into a standalone question using context from the "
+                "conversation history.\n\n"
+                "STRICT RULES:\n"
+                "1. Output ONLY a question — never a statement, never an answer, never a fact.\n"
+                "2. If the question is already self-contained and unambiguous, return it "
+                "EXACTLY as written (you may correct minor grammar only).\n"
+                "3. Never answer the question — only rewrite it as a standalone question.\n"
+                "4. Never add information that is not in the original question.\n"
+                "5. Your output must always end with a question mark.\n\n"
+                "EXAMPLES:\n"
+                "History: 'Which teams won more than 5 matches in 2019?' / 'What about 2020?' "
+                "→ 'Which teams won more than 5 matches in 2020?'\n"
+                "History: anything / 'who has the most runouts' "
+                "→ 'Who has the most runouts in IPL history?'\n"
+                "History: anything / 'show me their top scorers' "
+                "→ 'Who were the top run scorers for [the subject from history]?'",
+            ),
+            MessagesPlaceholder(variable_name="history"),
+            ("human", "{question}"),
+        ])
+        | llm
+        | StrOutputParser()
+    )
+
+    return _generate_query, _execute_query, _rephrase_answer, _select_table, _rewrite_query
 
 
 async def run_agent(question: str, thread_id: str) -> dict[str, str]:
@@ -323,7 +364,7 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
     """
     logger.info("run_agent | thread_id=%s | question=%r", thread_id, question)
 
-    generate_query, execute_query, rephrase_answer, select_table = _get_chain()
+    generate_query, execute_query, rephrase_answer, select_table, rewrite_query = _get_chain()
 
     # Retrieve (or create) the conversation history for this session.
     # history.messages is [] on the first turn, which is fine — the
@@ -343,23 +384,23 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
     # On the first turn (empty history) we skip the LLM call entirely — there
     # is nothing to resolve and we save one round-trip.
     if history.messages:
-        _rewrite_prompt = ChatPromptTemplate.from_messages([
-            (
-                "system",
-                "Given a conversation history and a follow-up question, rewrite the "
-                "follow-up as a fully standalone question that includes all necessary "
-                "context from the history. If the question is already self-contained, "
-                "return it unchanged. Return ONLY the rewritten question — no explanation, "
-                "no markdown, no extra punctuation.",
-            ),
-            MessagesPlaceholder(variable_name="history"),
-            ("human", "{question}"),
-        ])
-        _rewrite_chain = _rewrite_prompt | _llm | StrOutputParser()
-        standalone_question: str = await _rewrite_chain.ainvoke({
+        standalone_question: str = await rewrite_query.ainvoke({
             "history": history.messages,
             "question": question,
         })
+        # Safety guard: if the rewriter produced a statement instead of a question
+        # (hallucinated an answer), discard it and use the original question.
+        # A valid rewrite is short (< 3× the original) and ends with "?".
+        _looks_like_answer = (
+            not standalone_question.strip().endswith("?")
+            or len(standalone_question) > 3 * len(question)
+        )
+        if _looks_like_answer:
+            logger.warning(
+                "Query rewrite produced a non-question — falling back to original. "
+                "rewrite=%r", standalone_question,
+            )
+            standalone_question = question
         logger.info(
             "Query rewrite | original=%r | standalone=%r",
             question, standalone_question,
@@ -395,6 +436,26 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
     # Step 3 — Extract clean SQL from whatever the LLM returned.
     sql = _clean_sql(raw)
     logger.info("Cleaned SQL: %s", sql)
+
+    # Layer 2 — SQL output validation: block any non-SELECT statement before
+    # it reaches the database.  This is a defence-in-depth check — even if
+    # prompt injection or a model error causes the LLM to emit a destructive
+    # statement, it is stopped here.  Returns a safe answer to the user and
+    # skips execution entirely.
+    try:
+        validate_sql(sql)
+    except ValueError as exc:
+        answer = (
+            "Your question could not be answered because the generated query "
+            "was not a read-only SELECT statement. Please rephrase your question."
+        )
+        logger.warning(
+            "SQL validation blocked execution | thread_id=%s | reason=%s | sql=%r",
+            thread_id, exc, sql,
+        )
+        history.add_user_message(question)
+        history.add_ai_message(answer)
+        return {"answer": answer, "sql": sql}
 
     # Step 4 — Execute with automatic error correction on failure.
     # IMPORTANT: QuerySQLDataBaseTool never raises on SQL errors — it returns

@@ -489,3 +489,106 @@ if not _is_sql_error(result):
 # result is an error string → retry via _fix_sql
 sql_to_run = await _fix_sql(sql_to_run, question, result, table_names)
 ```
+
+---
+
+## #19 — Allrounder query: LLM counts wickets from `batsman` column instead of `bowler` column
+
+**Status: OPEN — not yet fully resolved**
+
+**Symptom**
+When asking *"Who are the best allrounders in IPL history?"*, the results are either wrong (everyone showing 1 wicket) or the `rephrase_answer` chain says "the data cannot be determined" instead of presenting the rows. Example bad SQL:
+
+```sql
+SELECT
+    batsman AS player,
+    SUM(batsman_runs) AS total_runs,
+    COUNT(DISTINCT CASE WHEN player_dismissed IS NOT NULL
+          AND dismissal_kind NOT IN ('run out','retired hurt','obstructing the field')
+          THEN player_dismissed END) AS total_wickets
+FROM deliveries
+GROUP BY batsman
+ORDER BY total_runs + total_wickets DESC
+LIMIT 10;
+```
+
+This counts distinct values of `player_dismissed` **grouped by `batsman`** — which yields 1 wicket for every player (a batsman's row only records themselves being dismissed, so `DISTINCT player_dismissed` = 1 at most). The fundamental error is computing bowling wickets from a batsman-grouped query.
+
+**Root cause**
+The LLM does not inherently know that:
+- Batting stats require `GROUP BY batsman`
+- Bowling wickets require `GROUP BY bowler`
+
+Without a teaching example, it conflates them into a single GROUP BY on `batsman`, producing valid SQL that runs without error but returns semantically incorrect results. Because the query succeeds (no DB error), `_fix_sql` is never triggered — the bad result flows straight to `rephrase_answer`.
+
+**Secondary symptom: `rephrase_answer` critiquing results**
+Even when the corrected CTE SQL ran successfully, `rephrase_answer` sometimes said "this cannot be determined" or audited the SQL instead of presenting the data. The LLM was treating the result rows as input for analysis rather than as the answer.
+
+**Attempts so far**
+
+### Attempt 1 — Added allrounder few-shot example to `IPL_EXAMPLES` (in `prompts.py`)
+
+Added a 9th example teaching the correct two-CTE pattern:
+
+```python
+{
+    "input": "Who are the best allrounders in IPL history?",
+    "query": (
+        "WITH batting AS (\n"
+        "    SELECT batsman AS player, SUM(batsman_runs) AS total_runs\n"
+        "    FROM deliveries\n"
+        "    GROUP BY batsman\n"
+        "),\n"
+        "bowling AS (\n"
+        "    SELECT bowler AS player, COUNT(*) AS total_wickets\n"
+        "    FROM deliveries\n"
+        "    WHERE dismissal_kind NOT IN ('run out', 'retired hurt', 'obstructing the field')\n"
+        "      AND player_dismissed IS NOT NULL\n"
+        "    GROUP BY bowler\n"
+        ")\n"
+        "SELECT bat.player, bat.total_runs, bowl.total_wickets\n"
+        "FROM batting bat\n"
+        "JOIN bowling bowl ON bat.player = bowl.player\n"
+        "WHERE bat.total_runs >= 500 AND bowl.total_wickets >= 20\n"
+        "ORDER BY (bat.total_runs + bowl.total_wickets * 20) DESC\n"
+        "LIMIT 10;"
+    ),
+},
+```
+
+**Expected**: The semantic similarity selector will surface this example when allrounder-type questions are asked, steering the model to use `GROUP BY bowler` for wickets.
+
+**Result**: Not yet confirmed as fixed — issue still open at time of writing.
+
+### Attempt 2 — Tightened `rephrase_answer` prompt with explicit RULES (in `agent.py`)
+
+The prompt was rewritten to prevent the LLM from critiquing or auditing the SQL result:
+
+```python
+answer_prompt = PromptTemplate.from_template(
+    """You are given a user question, the SQL query that was run, and the SQL result rows.
+Your job is to write a clear, concise natural-language answer based ONLY on the SQL result.
+
+RULES:
+1. Present the data from the SQL result as the answer — do NOT question whether the query is correct.
+2. Do NOT critique, analyse, or explain the SQL.
+3. Do NOT say the answer "cannot be determined" if data is present — use what the result gives you.
+4. If the result is a list of rows, present them clearly (e.g. as bullet points or a ranked list).
+
+Question: {question}
+SQL Query: {query}
+SQL Result: {result}
+Answer: """
+)
+```
+
+**Expected**: Prevents `rephrase_answer` from saying "cannot be determined" when result rows are present.
+
+**Result**: Addresses the secondary symptom but does not fix the root cause (wrong SQL generation).
+
+**What still needs to be tried**
+
+- Verify in Docker logs whether the new few-shot example is being selected by the semantic similarity selector for allrounder questions (look for which 3 examples are chosen at query time).
+- If the example is not being selected, consider adding it as a static (always-included) prefix in the system prompt instead of relying on the similarity selector.
+- Add a system prompt instruction explicitly stating the GROUP BY rule: *"To count bowling wickets, always GROUP BY bowler — never by batsman."*
+- Consider a post-generation validation step that checks if a "wickets" column is computed from a `GROUP BY batsman` clause and rejects it before execution.
