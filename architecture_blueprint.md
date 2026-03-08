@@ -148,30 +148,99 @@ Sub-title: `IPL Cricket Database · FastAPI + Next.js · GPT-4o + ChromaDB + Pos
 ## Quick Layout Sketch
 
 ```
-User ──► Next.js ──────────────────────────────────────────────────────────────────────►
-              │                                                                         │
-              │    ┌─────────────── FastAPI Backend ──────────────────────────┐        │
-              └───►│                                                           │        │
-                   │  /api/query ──► Guardrail ──► Rewrite ──────────────────►│        │
-                   │                    │               │                      │        │
-                   │                  (400)        ┌────┴────┐                 │        │
-                   │                              Table  Cricket               │        │
-                   │                             Selector Knowledge            │        │
-                   │                               Agent    Agent              │        │
-                   │                                  └────┬────┘              │        │
-                   │                                       ▼                   │        │
-                   │                                  SQL Agent ──► LLMs       │        │
-                   │                                       │                   │        │
-                   │                                  Execute SQL ◄──────┐     │        │
-                   │                                       │    Fix SQL   │     │        │
-                   │                                       │    Agent ───►│     │        │
-                   │                                       ▼              │     │        │
-                   │                                  Analysis Agent      │     │        │
-                   │                                       │              │     │        │
-                   └───────────────────────────────────────┼──────────────┘     │        │
-                                                           └────────────────────┘        │
-                                                                                          │
-    ChromaDB          PostgreSQL      LLM Providers                                      │
-    (Few-shot)         (ipl_db)      GPT-4o / Claude                                     │
-    (Cricket Rules)                  Gemini / DeepSeek                                   │
+                              ┌──────────────────────────────────────────────────────────────────────────────────────────┐
+                              │                              NL2SQL Agent — System Architecture                          │
+                              └──────────────────────────────────────────────────────────────────────────────────────────┘
+
+  ┌──────────┐   HTTP POST      ┌───────────────────────────────────────────────────────────────────────────────────┐
+  │          │  /api/query      │  FastAPI Backend  (port 8086)                                                     │
+  │  Next.js │ ──────────────►  │                                                                                   │
+  │  port    │                  │  ┌─────────────────────────────┐                                                  │
+  │  8085    │                  │  │  POST /api/query             │                                                  │
+  │          │                  │  │  routes/query.py             │                                                  │
+  │  Chat UI │                  │  │  · 60s timeout               │                                                  │
+  │  thread  │                  │  │  · 429 on RateLimitError     │                                                  │
+  │  _id     │                  │  └──────────────┬──────────────┘                                                  │
+  │  session │                  │                 │                                                                  │
+  └──────────┘                  │                 ▼                                                                  │
+       ▲                        │  ┌──────────────────────────────┐                                                  │
+       │                        │  │  Guardrail Agent             │──── HTTP 400 ──────────────────────────────────► │ ──► User
+       │                        │  │  input_validator.py          │     (rejected)                                   │
+       │                        │  │  · max 500 chars             │                                                  │
+       │                        │  │  · regex injection check     │                                                  │
+       │                        │  │  · DDL keyword block         │                                                  │
+       │                        │  └──────────────┬───────────────┘                                                  │
+       │                        │                 │ valid                                                            │
+       │                        │                 ▼                                                                  │
+       │                        │  ┌──────────────────────────────┐                                                  │
+       │                        │  │  Rewrite Agent               │                                                  │
+       │                        │  │  agent.py · Step 0           │                                                  │
+       │                        │  │  · rewrites follow-ups       │                                                  │
+       │                        │  │  · skipped on first turn     │                                                  │
+       │                        │  └──────────┬───────────────────┘                                                  │
+       │                        │             │ standalone_question                                                   │
+       │                        │        ┌────┴──────────────────────┐   asyncio.gather (parallel)                   │
+       │                        │        │                           │                                               │
+       │                        │        ▼                           ▼                                               │
+       │                        │  ┌───────────────┐   ┌──────────────────────┐                                     │
+       │                        │  │ Table Selector│   │ Cricket Knowledge    │◄── ChromaDB ──────────────────────►  │
+       │                        │  │ Agent         │   │ Agent                │    cricket_rules                     │
+       │                        │  │ table_        │◄──│ cricket_knowledge.py │    collection                        │
+       │                        │  │ selector.py   │   │ · k=3 sections       │                                     │
+       │                        │  └───────┬───────┘   └──────────┬───────────┘                                     │
+       │                        │          │  table_names          │ cricket_context                                  │
+       │                        │          └───────────┬───────────┘                                                  │
+       │                        │                      │                                                              │
+       │                        │                      ▼                                                              │
+       │                        │  ┌──────────────────────────────┐      ┌──────────────────────────┐                │
+       │                        │  │  SQL Agent                   │─────►│  LLM Providers           │                │
+       │                        │  │  prompts.py · Step 2         │      │                          │                │
+       │                        │  │  · NL → SQL                  │◄─────│  Primary: GPT-4o         │                │
+       │                        │  │  · k=3 few-shot examples     │      │  Fallback 1: Claude      │                │
+       │                        │  │  · {cricket_context}         │◄─────│  Fallback 2: Gemini      │                │
+       │                        │  │  · conversation history      │      │  Fallback 3: DeepSeek    │                │
+       │                        │  └──────────────┬───────────────┘      └──────────────────────────┘                │
+       │                        │                 │◄── ChromaDB                                                       │
+       │                        │                 │    few_shot_examples                                              │
+       │                        │                 │    collection                                                     │
+       │                        │                 ▼                                                                   │
+       │                        │  ┌──────────────────────────────┐                                                   │
+       │                        │  │  validate_sql()              │──── HTTP 200 (safe answer) ─────────────────────► │ ──► User
+       │                        │  │  sql_helpers.py · Layer 3    │     (SQL blocked)
+       │                        │  │  · must start SELECT or WITH │
+       │                        │  │  · blocks DROP/DELETE/etc    │
+       │                        │  └──────────────┬───────────────┘
+       │                        │                 │ valid SQL
+       │                        │                 ▼
+       │                        │  ┌──────────────────────────────┐      ┌─────────────────────────────┐
+       │                        │  │  Execute SQL                 │─────►│  PostgreSQL                 │
+       │                        │  │  sql_helpers.py · Step 4     │◄─────│  ipl_db                     │
+       │                        │  │  · QuerySQLDataBaseTool      │      │  9 tables · 278k+ rows      │
+       │                        │  │  · errors as strings         │      └─────────────────────────────┘
+       │                        │  └──────┬───────────────────────┘
+       │                        │         │ error string             ┌──────────────────────────────┐
+       │                        │         └─────────────────────────►  Fix SQL Agent               │
+       │                        │                                    │  agent.py · _fix_sql         │
+       │                        │         ┌──────────────────────────│  · reads error + schema      │
+       │                        │         │ corrected SQL (max 2x)   │  · LLM rewrites query        │
+       │                        │         ▼                          └──────────────────────────────┘
+       │                        │  ┌──────────────────────────────┐
+       │                        │  │  Analysis Agent              │
+       │                        │  │  agent.py · Step 5           │
+       │                        │  │  · rephrase_answer           │
+       │                        │  │  · raw result → natural lang │
+       │                        │  └──────────────┬───────────────┘
+       │                        │                 │
+       │                        │                 ▼
+       │                        │  ┌──────────────────────────────┐
+       │                        │  │  Conversation History        │
+       │                        │  │  agent.py                    │
+       │                        │  │  · in-memory dict[thread_id] │
+       │                        │  │  · original question stored  │
+       │                        │  └──────────────┬───────────────┘
+       │                        │                 │ {answer, sql}
+       │                        └─────────────────┼───────────────────────────────────────────────┘
+       │                                          │
+       └──────────────────────────────────────────┘
+                          answer displayed in chat UI
 ```
