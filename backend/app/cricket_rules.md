@@ -1,8 +1,8 @@
 # Cricket Rules Specification
 
-**Version:** 1.0  
-**Status:** Draft  
-**Owner:** Analytics / NL2SQL  
+**Version:** 1.0
+**Status:** Draft
+**Owner:** Analytics / NL2SQL
 **Scope:** IPL ball-by-ball analytics using the current PostgreSQL schema
 
 ---
@@ -55,10 +55,12 @@ This specification applies to the following tables:
 
 ## 4. Canonical Schema Mappings
 
-## 4.1 Fact Table
+### 4.1 Fact Table
+
 Use `deliveries` as the ball-by-ball fact table.
 
-## 4.2 Match Metadata
+### 4.2 Match Metadata
+
 Use `matches` for:
 
 - `season`
@@ -72,7 +74,8 @@ Use `matches` for:
 - `player_of_match`
 - `match_stage`
 
-## 4.3 Player Metadata
+### 4.3 Player Metadata
+
 Use `players` for:
 
 - `player_name`
@@ -82,7 +85,8 @@ Use `players` for:
 - `is_keeper`
 - `is_occasional_keeper`
 
-## 4.4 Participation Sources
+### 4.4 Participation Sources
+
 A player may be considered present in a match if they appear in any of:
 
 - `playing_xi.player_name`
@@ -99,83 +103,104 @@ A player may be considered present in a match if they appear in any of:
 
 These derived fields must be used consistently in analytics and SQL generation.
 
-## 5.1 Total Runs on Ball
+### 5.1 Total Runs on Ball
+
 There is no `total_runs` source column in the schema.
 
 ```sql
 total_runs = COALESCE(batsman_runs, 0) + COALESCE(extras, 0)
-5.2 Legal Delivery
+```
+
+### 5.2 Legal Delivery
 
 A legal delivery is any ball that is not a wide and not a no-ball.
 
+```sql
 legal_ball = NOT is_wide AND NOT is_no_ball
-5.3 Ball Faced by Batter
+```
+
+### 5.3 Ball Faced by Batter
 
 A ball counts as faced by the batter unless it is a wide.
 
+```sql
 ball_faced_by_batter = NOT is_wide
-5.4 Bowler Runs Conceded
+```
+
+### 5.4 Bowler Runs Conceded
 
 Byes and leg-byes are not charged to the bowler.
 
+```sql
 bowler_runs_conceded =
     COALESCE(batsman_runs, 0)
     + CASE
         WHEN is_wide OR is_no_ball THEN COALESCE(extras, 0)
         ELSE 0
       END
-5.5 Dot Ball
+```
+
+### 5.5 Dot Ball
 
 Default bowling dot-ball rule:
 
+```sql
 dot_ball = legal_ball AND total_runs = 0
-5.6 Boundary Flags
+```
+
+### 5.6 Boundary Flags
+
+```sql
 is_four = batsman_runs = 4
 is_six  = batsman_runs = 6
-6. Phase Definitions
+```
+
+---
+
+## 6. Phase Definitions
 
 The schema uses zero-based over numbering.
 
-6.1 Schema-Based T20 Phase Mapping
+### 6.1 Schema-Based T20 Phase Mapping
 
-Powerplay: overs 0–5
+- Powerplay: overs 0–5
+- Middle: overs 6–14
+- Death: overs 15–19
 
-Middle: overs 6–14
+### 6.2 User-Facing T20 Phase Mapping
 
-Death: overs 15–19
+- Powerplay: overs 1–6
+- Middle: overs 7–15
+- Death: overs 16–20
 
-6.2 User-Facing T20 Phase Mapping
+### 6.3 Canonical SQL Phase Expression
 
-Powerplay: overs 1–6
-
-Middle: overs 7–15
-
-Death: overs 16–20
-
-6.3 Canonical SQL Phase Expression
+```sql
 CASE
   WHEN over BETWEEN 0 AND 5 THEN 'powerplay'
   WHEN over BETWEEN 6 AND 14 THEN 'middle'
   ELSE 'death'
 END
-7. Dismissal Attribution Rules
-7.1 Bowler Wicket Types
+```
+
+---
+
+## 7. Dismissal Attribution Rules
+
+### 7.1 Bowler Wicket Types
 
 The following dismissal kinds count as wickets credited to the bowler:
 
-bowled
+- `bowled`
+- `caught`
+- `caught and bowled`
+- `lbw`
+- `stumped`
+- `hit wicket`
 
-caught
+**Canonical Rule:**
 
-caught and bowled
-
-lbw
-
-stumped
-
-hit wicket
-
-Canonical Rule
+```sql
 dismissal_kind IN (
   'bowled',
   'caught',
@@ -184,87 +209,156 @@ dismissal_kind IN (
   'stumped',
   'hit wicket'
 )
-7.2 Non-Bowler Wicket Types
+```
+
+### 7.2 Non-Bowler Wicket Types
 
 The following do not count as wickets credited to the bowler:
 
-run out
+- `run out`
+- `retired hurt`
+- `retired out`
+- `obstructing the field`
 
-retired hurt
-
-retired out
-
-obstructing the field
-
-7.3 Batter Outs
+### 7.3 Batter Outs
 
 For batting average, a batter is considered out when:
 
-player_dismissed IS NOT NULL
+- `player_dismissed IS NOT NULL`
+- and `dismissal_kind <> 'retired hurt'`
 
-and dismissal_kind <> 'retired hurt'
+---
 
-8. Batting Rules
-8.1 Batting Aggregation Grain
+## 8. Batting Rules
+
+### 8.1 Batting Aggregation Grain
 
 Batting metrics must aggregate by batter.
 
-Correct
+**Correct:**
+
+```sql
 GROUP BY batsman
-Match-Level
+```
+
+**Match-Level:**
+
+```sql
 GROUP BY match_id, batsman
-8.2 Batting Innings
+```
+
+### 8.2 Batting Innings
 
 A player has a batting innings if they:
 
-faced at least one ball, or
+- faced at least one ball, or
+- were dismissed without facing
 
-were dismissed without facing
+### 8.3 Batting Metrics
 
-8.3 Batting Metrics
-Runs
+#### Runs
+
+```sql
 runs = SUM(batsman_runs)
-Balls Faced
+```
+
+#### Balls Faced
+
+```sql
 balls_faced = COUNT(*) FILTER (WHERE is_wide = false)
-Outs
+```
+
+#### Outs
+
+```sql
 outs = COUNT(*) FILTER (
   WHERE player_dismissed IS NOT NULL
     AND dismissal_kind <> 'retired hurt'
 )
-Batting Average
+```
+
+#### Batting Average
+
+```sql
 batting_average = runs / outs
-Strike Rate
+```
+
+#### Strike Rate
+
+```sql
 strike_rate = 100.0 * runs / balls_faced
-Runs Per Innings
+```
+
+#### Runs Per Innings
+
+```sql
 runs_per_innings = runs / batting_innings
-Fours / Sixes
+```
+
+#### Fours / Sixes
+
+```sql
 fours = COUNT(*) FILTER (WHERE batsman_runs = 4)
 sixes = COUNT(*) FILTER (WHERE batsman_runs = 6)
-Boundary Run Percentage
+```
+
+#### Boundary Run Percentage
+
+```sql
 boundary_run_pct = 100.0 * ((4 * fours) + (6 * sixes)) / runs
-Phase Strike Rate
+```
+
+#### Phase Strike Rate
+
+```sql
 phase_strike_rate = 100.0 * phase_runs / phase_balls
-9. Bowling Rules
-9.1 Bowling Aggregation Grain
+```
+
+---
+
+## 9. Bowling Rules
+
+### 9.1 Bowling Aggregation Grain
 
 Bowling metrics must aggregate by bowler.
 
-Correct
+**Correct:**
+
+```sql
 GROUP BY bowler
-Match-Level
+```
+
+**Match-Level:**
+
+```sql
 GROUP BY match_id, bowler
-Never Do This
+```
 
-Do not compute bowling wickets grouped by batsman.
+> **Never Do This:** Do not compute bowling wickets grouped by batsman.
 
-9.2 Bowling Metrics
-Legal Balls
+### 9.2 Bowling Metrics
+
+#### Legal Balls
+
+```sql
 legal_balls = COUNT(*) FILTER (WHERE is_wide = false AND is_no_ball = false)
-Overs Bowled
+```
+
+#### Overs Bowled
+
+```sql
 overs_bowled = legal_balls / 6.0
-Runs Conceded
+```
+
+#### Runs Conceded
+
+```sql
 runs_conceded = SUM(bowler_runs_conceded)
-Wickets
+```
+
+#### Wickets
+
+```sql
 wickets = COUNT(*) FILTER (
   WHERE dismissal_kind IN (
     'bowled',
@@ -275,270 +369,321 @@ wickets = COUNT(*) FILTER (
     'hit wicket'
   )
 )
-Bowling Average
+```
+
+#### Bowling Average
+
+```sql
 bowling_average = runs_conceded / wickets
-Bowling Strike Rate
+```
+
+#### Bowling Strike Rate
+
+```sql
 bowling_strike_rate = legal_balls / wickets
-Economy Rate
+```
+
+#### Economy Rate
+
+```sql
 economy_rate = 6.0 * runs_conceded / legal_balls
-Wickets Per 24 Balls
+```
+
+#### Wickets Per 24 Balls
 
 Useful T20 indicator:
 
+```sql
 wickets_per_24_balls = 24.0 * wickets / legal_balls
-Dot Ball Percentage
+```
+
+#### Dot Ball Percentage
+
+```sql
 dot_ball_pct = 100.0 * dot_balls / legal_balls
-Phase Economy
+```
+
+#### Phase Economy
+
+```sql
 phase_economy = 6.0 * phase_runs_conceded / phase_legal_balls
-10. Fielding Rules
-10.1 Fielding Aggregation Grain
+```
 
-Fielding metrics must aggregate by fielder_name.
+---
 
-Correct
+## 10. Fielding Rules
+
+### 10.1 Fielding Aggregation Grain
+
+Fielding metrics must aggregate by `fielder_name`.
+
+**Correct:**
+
+```sql
 GROUP BY fielder_name
-Match-Level
+```
+
+**Match-Level:**
+
+```sql
 GROUP BY match_id, fielder_name
-10.2 Source
+```
 
-Use wicket_fielders.
+### 10.2 Source
 
-10.3 Fielding Metrics
-Catches
+Use `wicket_fielders`.
+
+### 10.3 Fielding Metrics
+
+#### Catches
+
+```sql
 catches = COUNT(*) FILTER (
   WHERE wicket_kind = 'caught'
     AND is_substitute = false
 )
-Run-Out Involvements
+```
+
+#### Run-Out Involvements
+
+```sql
 runout_involvements = COUNT(*) FILTER (
   WHERE wicket_kind = 'run out'
     AND is_substitute = false
 )
-Stumpings
+```
+
+#### Stumpings
+
+```sql
 stumpings = COUNT(*) FILTER (
   WHERE wicket_kind = 'stumped'
     AND is_substitute = false
 )
-10.4 Substitute Fielders
+```
+
+### 10.4 Substitute Fielders
 
 Default rule: exclude substitute fielders from player fielding metrics.
 
-11. Participation and Match Presence Rules
+---
+
+## 11. Participation and Match Presence Rules
 
 A player is counted as having played a match if they appear in any of:
 
-playing_xi
-
-replacements.player_in
-
-batting events
-
-bowling events
-
-dismissal events
-
-fielding events
+- `playing_xi`
+- `replacements.player_in`
+- batting events
+- bowling events
+- dismissal events
+- fielding events
 
 This rule is used for:
 
-matches_played
+- `matches_played`
+- eligibility thresholds
+- recent-form windows
+- match-window rankings
 
-eligibility thresholds
+---
 
-recent-form windows
+## 12. Eligibility Rules
 
-match-window rankings
+### 12.1 Batter Eligibility
 
-12. Eligibility Rules
-12.1 Batter Eligibility
-Recommended Default
+**Recommended Default:**
 
-matches_played >= 3
+- `matches_played >= 3`
+- `balls_faced >= 30`
 
-balls_faced >= 30
+**Stricter Season-Level:**
 
-Stricter Season-Level
+- `matches_played >= 5`
+- `balls_faced >= 60`
 
-matches_played >= 5
+### 12.2 Bowler Eligibility
 
-balls_faced >= 60
+**Recommended Default:**
 
-12.2 Bowler Eligibility
-Recommended Default
+- `matches_played >= 3`
+- `legal_balls >= 24`
 
-matches_played >= 3
+**Stricter Season-Level:**
 
-legal_balls >= 24
+- `matches_played >= 5`
+- `legal_balls >= 60`
 
-Stricter Season-Level
-
-matches_played >= 5
-
-legal_balls >= 60
-
-12.3 All-Rounder Eligibility
+### 12.3 All-Rounder Eligibility
 
 A player qualifies as an all-rounder candidate only if they satisfy both batting and bowling contribution rules.
 
-Minimum Logical Definition
+**Minimum Logical Definition:**
+
+```sql
 allrounder = has_batting_record AND has_bowling_record
-Recommended Season-Level Thresholds
+```
 
-matches_played >= 5
+**Recommended Season-Level Thresholds:**
 
-batting_innings >= 4
+- `matches_played >= 5`
+- `batting_innings >= 4`
+- `bowling_innings >= 4`
+- `balls_faced >= 60`
+- `legal_balls >= 60`
 
-bowling_innings >= 4
+**Recommended Dynamic Thresholds for General Windows:**
 
-balls_faced >= 60
-
-legal_balls >= 60
-
-Recommended Dynamic Thresholds for General Windows
-matches_played >= max(3, ceil(window_match_count * 0.30))
+```sql
+matches_played  >= max(3, ceil(window_match_count * 0.30))
 batting_innings >= max(2, ceil(window_match_count * 0.25))
 bowling_innings >= max(2, ceil(window_match_count * 0.25))
-balls_faced >= max(24, window_match_count * 8)
-legal_balls >= max(24, window_match_count * 8)
-13. Windowing Rules
+balls_faced     >= max(24, window_match_count * 8)
+legal_balls     >= max(24, window_match_count * 8)
+```
+
+---
+
+## 13. Windowing Rules
 
 All rankings must be computed over a resolved match set.
 
 Supported windows include:
 
-single season
+- single season
+- multiple seasons
+- date range
+- all-time
+- last N global matches
+- last N player matches
+- team-specific windows
+- opponent-specific windows
+- venue-specific windows
+- stage-specific windows
 
-multiple seasons
+> **Mandatory Rule:** Eligibility, normalization, context baselines, and ranking must all be computed from the same selected match set.
 
-date range
+---
 
-all-time
+## 14. Normalization Rules
 
-last N global matches
+### 14.1 Preferred Method
 
-last N player matches
+Use percentile rank within the selected candidate set (0 to 100 percentile).
 
-team-specific windows
-
-opponent-specific windows
-
-venue-specific windows
-
-stage-specific windows
-
-Mandatory Rule
-
-Eligibility, normalization, context baselines, and ranking must all be computed from the same selected match set.
-
-14. Normalization Rules
-14.1 Preferred Method
-
-Use percentile rank within the selected candidate set.
-
-0 to 100 percentile
-14.2 Inverse Metrics
+### 14.2 Inverse Metrics
 
 For lower-is-better metrics such as:
 
-economy
+- economy
+- bowling strike rate
+- bowling average
 
-bowling strike rate
+Invert before scoring, or rank descending appropriately.
 
-bowling average
-
-invert before scoring, or rank descending appropriately.
-
-14.3 Window-Scoped Normalization
+### 14.3 Window-Scoped Normalization
 
 Do not normalize a season-level ranking against all-time data unless explicitly requested.
 
-15. Ranking Rules
-15.1 Best Batter
+---
+
+## 15. Ranking Rules
+
+### 15.1 Best Batter
 
 Do not rank batters by runs alone unless the user explicitly asks for total runs.
 
 Preferred batting ranking inputs:
 
-runs per innings
+- runs per innings
+- batting average
+- strike rate
+- phase-adjusted strike rate
 
-batting average
-
-strike rate
-
-phase-adjusted strike rate
-
-15.2 Best Bowler
+### 15.2 Best Bowler
 
 Do not rank bowlers by wickets alone unless the user explicitly asks for total wickets.
 
 Preferred bowling ranking inputs:
 
-wickets per 24 balls
+- wickets per 24 balls
+- economy
+- bowling strike rate
+- dot-ball percentage
+- phase-adjusted economy
 
-economy
-
-bowling strike rate
-
-dot-ball percentage
-
-phase-adjusted economy
-
-15.3 Best All-Rounder
+### 15.3 Best All-Rounder
 
 Do not rank all-rounders by:
 
-runs + wickets
-
-or
-
-runs + wickets * arbitrary_constant
+- `runs + wickets`
+- `runs + wickets * arbitrary_constant`
 
 A valid all-rounder ranking must combine:
 
-batting quality
+- batting quality
+- bowling quality
+- balance across both disciplines
+- optional fielding bonus
+- optional awards / impact bonus
+- reliability correction
 
-bowling quality
+---
 
-balance across both disciplines
+## 16. Canonical V1 All-Rounder Scoring Rules
 
-optional fielding bonus
+### 16.1 Batting Quality Score
 
-optional awards / impact bonus
-
-reliability correction
-
-16. Canonical V1 All-Rounder Scoring Rules
-16.1 Batting Quality Score
+```
 BattingQualityScore =
   0.30 * pct(runs_per_innings)
 + 0.25 * pct(batting_average)
 + 0.20 * pct(strike_rate)
 + 0.25 * pct(phase_adjusted_batting_sr_delta)
-16.2 Bowling Quality Score
+```
+
+### 16.2 Bowling Quality Score
+
+```
 BowlingQualityScore =
   0.25 * pct(wickets_per_24_balls)
 + 0.25 * pct(inv_economy)
 + 0.20 * pct(inv_bowling_strike_rate)
 + 0.15 * pct(dot_ball_pct)
 + 0.15 * pct(phase_adjusted_bowling_econ_delta)
-16.3 Fielding Score
+```
+
+### 16.3 Fielding Score
+
+```
 FieldingScore =
   0.70 * pct(catches_per_match)
 + 0.30 * pct(runouts_per_match)
-16.4 Balance Score
+```
+
+### 16.4 Balance Score
 
 Use harmonic mean to prevent specialists from dominating all-rounder rankings.
 
+```
 BalanceScore =
-2 * BattingQualityScore * BowlingQualityScore
-/ (BattingQualityScore + BowlingQualityScore)
-16.5 Reliability Factor
+  2 * BattingQualityScore * BowlingQualityScore
+  / (BattingQualityScore + BowlingQualityScore)
+```
+
+### 16.5 Reliability Factor
+
+```
 ReliabilityFactor =
-sqrt(
-  min(1, balls_faced / 120.0)
-  * min(1, legal_balls / 120.0)
-)
-16.6 Final Score
+  sqrt(
+    min(1, balls_faced / 120.0)
+    * min(1, legal_balls / 120.0)
+  )
+```
+
+### 16.6 Final Score
+
+```
 FinalScoreRaw =
   0.35 * BattingQualityScore
 + 0.35 * BowlingQualityScore
@@ -547,153 +692,159 @@ FinalScoreRaw =
 + 0.05 * pct(player_of_match_count)
 
 FinalScore =
-FinalScoreRaw * (0.85 + 0.15 * ReliabilityFactor)
-17. Context Adjustment Rules
-17.1 Batting Phase Baseline
+  FinalScoreRaw * (0.85 + 0.15 * ReliabilityFactor)
+```
+
+---
+
+## 17. Context Adjustment Rules
+
+### 17.1 Batting Phase Baseline
 
 For the selected window:
 
+```
 baseline_phase_strike_rate = 100.0 * total_phase_runs / total_phase_balls
-17.2 Bowling Phase Baseline
+```
+
+### 17.2 Bowling Phase Baseline
 
 For the selected window:
 
+```
 baseline_phase_economy = 6.0 * total_phase_runs_conceded / total_phase_legal_balls
-17.3 Batting Phase Adjustment
+```
 
-A player’s phase-adjusted batting score should compare their phase strike rates against the selected window phase baseline.
+### 17.3 Batting Phase Adjustment
 
-17.4 Bowling Phase Adjustment
+A player's phase-adjusted batting score should compare their phase strike rates against the selected window phase baseline.
 
-A player’s phase-adjusted bowling score should compare their phase economy against the selected window phase baseline.
+### 17.4 Bowling Phase Adjustment
 
-17.5 Fallback Hierarchy for Small Windows
+A player's phase-adjusted bowling score should compare their phase economy against the selected window phase baseline.
+
+### 17.5 Fallback Hierarchy for Small Windows
 
 If the selected window is too small, use:
 
-exact window baseline
+1. exact window baseline
+2. season baseline
+3. all-time baseline
 
-season baseline
+---
 
-all-time baseline
+## 18. SQL Generation Rules for NL2SQL
 
-18. SQL Generation Rules for NL2SQL
-18.1 Role-Correct Grouping
+### 18.1 Role-Correct Grouping
 
-batting → GROUP BY batsman
+- batting → `GROUP BY batsman`
+- bowling → `GROUP BY bowler`
+- fielding → `GROUP BY fielder_name`
 
-bowling → GROUP BY bowler
-
-fielding → GROUP BY fielder_name
-
-18.2 Use Explicit Wicket Logic
+### 18.2 Use Explicit Wicket Logic
 
 Prefer:
 
+```sql
 dismissal_kind IN (...)
+```
 
-Do not rely only on NOT IN (...) unless fully controlled.
+Do not rely only on `NOT IN (...)` unless fully controlled.
 
-18.3 Use Schema-Correct Column Mappings
+### 18.3 Use Schema-Correct Column Mappings
 
-Never invent missing columns such as total_runs if not present in schema.
+Never invent missing columns such as `total_runs` if not present in schema. Use:
 
-Use:
-
+```sql
 COALESCE(batsman_runs, 0) + COALESCE(extras, 0)
-18.4 Avoid Grain Mismatch
+```
+
+### 18.4 Avoid Grain Mismatch
 
 Do not join player-level aggregates to ball-level or match-level rows without re-aggregation.
 
-18.5 Protect Divisions
+### 18.5 Protect Divisions
 
-Use NULLIF() or CASE to avoid divide-by-zero.
+Use `NULLIF()` or `CASE` to avoid divide-by-zero.
 
-18.6 Prefer Window-Scoped Queries
+### 18.6 Prefer Window-Scoped Queries
 
 Every ranking query should first resolve the match window, then compute metrics inside that window.
 
-19. Mandatory Rules
+---
+
+## 19. Mandatory Rules
 
 These rules are non-negotiable.
 
-Bowling wickets must be grouped by bowler.
+- Bowling wickets must be grouped by bowler.
+- Batting runs must be grouped by batsman.
+- Legal-ball bowling metrics must exclude wides and no-balls.
+- Batter balls faced must exclude wides.
+- Bowler wickets must be based on explicit dismissal-kind inclusion.
+- `total_runs` must be derived as `batsman_runs + extras`.
+- `bowler_runs_conceded` must not include byes / leg-byes.
+- All-rounder ranking must not use only runs and wickets.
+- Eligibility thresholds must be applied before all-rounder ranking.
+- Normalization must be scoped to the selected ranking window.
 
-Batting runs must be grouped by batsman.
+---
 
-Legal-ball bowling metrics must exclude wides and no-balls.
-
-Batter balls faced must exclude wides.
-
-Bowler wickets must be based on explicit dismissal-kind inclusion.
-
-total_runs must be derived as batsman_runs + extras.
-
-bowler_runs_conceded must not include byes / leg-byes.
-
-All-rounder ranking must not use only runs and wickets.
-
-Eligibility thresholds must be applied before all-rounder ranking.
-
-Normalization must be scoped to the selected ranking window.
-
-20. Recommended Rules
+## 20. Recommended Rules
 
 These are strongly recommended defaults.
 
-Exclude substitute fielders from fielding metrics.
+- Exclude substitute fielders from fielding metrics.
+- Exclude super overs unless explicitly requested.
+- Use percentile normalization for ranking models.
+- Use harmonic mean as the balance score in all-rounder ranking.
+- Use phase-adjusted batting and bowling context metrics.
+- Use dynamic eligibility thresholds for arbitrary windows.
+- Use a canonical player-mapping layer if name variation exists.
 
-Exclude super overs unless explicitly requested.
+---
 
-Use percentile normalization for ranking models.
-
-Use harmonic mean as the balance score in all-rounder ranking.
-
-Use phase-adjusted batting and bowling context metrics.
-
-Use dynamic eligibility thresholds for arbitrary windows.
-
-Use a canonical player-mapping layer if name variation exists.
-
-21. Anti-Patterns
+## 21. Anti-Patterns
 
 The following are invalid or discouraged.
 
-Invalid
+**Invalid:**
 
-bowling wickets grouped by batsman
+- bowling wickets grouped by batsman
+- using non-existent `total_runs` column
+- using all-rounder score = `runs + wickets`
+- counting run out as a bowler wicket
+- including wides in balls faced
+- including byes / leg-byes in bowler runs conceded
 
-using non-existent total_runs column
+**Discouraged:**
 
-using all-rounder score = runs + wickets
+- arbitrary constants like `wickets * 20`
+- global normalization for a small custom window
+- ranking without eligibility thresholds
+- ranking all-rounders without a balance term
 
-counting run out as a bowler wicket
+---
 
-including wides in balls faced
+## 22. Compact Reference Table
 
-including byes / leg-byes in bowler runs conceded
+| Category | Rule |
+|---|---|
+| Metric formulas | Strike rate = `100 * runs / balls_faced`; Economy = `6 * runs_conceded / legal_balls`; Bat avg = `runs / outs`; Bowl avg = `runs_conceded / wickets` |
+| Eligibility rules | All-rounder must have both batting and bowling contribution, plus minimum thresholds |
+| Phase definitions | Powerplay = overs 1–6 cricket view / 0–5 schema view; Middle = 7–15 / 6–14; Death = 16–20 / 15–19 |
+| SQL GROUP BY rules | Batting → `GROUP BY batsman`; Bowling → `GROUP BY bowler`; Fielding → `GROUP BY fielder_name` |
+| Dismissal filters | Bowler wicket types = `bowled`, `caught`, `caught and bowled`, `lbw`, `stumped`, `hit wicket` |
+| Column mappings | `total_runs = batsman_runs + extras`; `bowler_runs_conceded = batsman_runs + wide/no-ball extras only` |
+| Valid player filters | Legal delivery = `is_wide = false AND is_no_ball = false`; Batter ball faced = `is_wide = false` |
 
-Discouraged
+---
 
-arbitrary constants like wickets * 20
+## 23. Minimal SQL Examples
 
-global normalization for a small custom window
+### 23.1 Batting Strike Rate
 
-ranking without eligibility thresholds
-
-ranking all-rounders without a balance term
-
-22. Compact Reference Table
-Category	Rule
-Metric formulas	Strike rate = 100 * runs / balls_faced; Economy = 6 * runs_conceded / legal_balls; Bat avg = runs / outs; Bowl avg = runs_conceded / wickets
-Eligibility rules	All-rounder must have both batting and bowling contribution, plus minimum thresholds
-Phase definitions	Powerplay = overs 1–6 cricket view / 0–5 schema view; Middle = 7–15 / 6–14; Death = 16–20 / 15–19
-SQL GROUP BY rules	Batting → GROUP BY batsman; Bowling → GROUP BY bowler; Fielding → GROUP BY fielder_name
-Dismissal filters	Bowler wicket types = bowled, caught, caught and bowled, lbw, stumped, hit wicket
-Column mappings	total_runs = batsman_runs + extras; bowler_runs_conceded = batsman_runs + wide/no-ball extras only
-Valid player filters	Legal delivery = is_wide = false AND is_no_ball = false; Batter ball faced = is_wide = false
-23. Minimal SQL Examples
-23.1 Batting Strike Rate
+```sql
 SELECT
     batsman,
     SUM(batsman_runs) AS runs,
@@ -705,7 +856,11 @@ SELECT
     ) AS strike_rate
 FROM deliveries
 GROUP BY batsman;
-23.2 Bowling Economy
+```
+
+### 23.2 Bowling Economy
+
+```sql
 SELECT
     bowler,
     COUNT(*) FILTER (WHERE is_wide = false AND is_no_ball = false) AS legal_balls,
@@ -729,7 +884,11 @@ SELECT
     ) AS economy_rate
 FROM deliveries
 GROUP BY bowler;
-23.3 Bowling Wickets
+```
+
+### 23.3 Bowling Wickets
+
+```sql
 SELECT
     bowler,
     COUNT(*) FILTER (
@@ -744,7 +903,11 @@ SELECT
     ) AS wickets
 FROM deliveries
 GROUP BY bowler;
-23.4 Basic All-Rounder Candidate Filter
+```
+
+### 23.4 Basic All-Rounder Candidate Filter
+
+```sql
 WITH batting AS (
     SELECT
         batsman AS player,
@@ -768,53 +931,44 @@ JOIN bowling bw
   ON bw.player = b.player
 WHERE b.balls_faced >= 60
   AND bw.legal_balls >= 60;
-24. NL2SQL Policy Summary
+```
+
+---
+
+## 24. NL2SQL Policy Summary
 
 When generating cricket SQL:
 
-identify whether the question is about batting, bowling, fielding, or all-round performance
+- identify whether the question is about batting, bowling, fielding, or all-round performance
+- resolve the match window first
+- use schema-correct derived columns
+- apply role-correct grouping
+- apply correct dismissal attribution
+- apply eligibility rules before ranking
+- avoid arbitrary heuristics unless explicitly labeled as rough
+- for all-rounders, use batting quality + bowling quality + balance
 
-resolve the match window first
+---
 
-use schema-correct derived columns
-
-apply role-correct grouping
-
-apply correct dismissal attribution
-
-apply eligibility rules before ranking
-
-avoid arbitrary heuristics unless explicitly labeled as rough
-
-for all-rounders, use batting quality + bowling quality + balance
-
-25. Future Improvements
+## 25. Future Improvements
 
 The following enhancements are recommended for future versions:
 
-canonical player identity mapping table
+- canonical player identity mapping table
+- explicit super-over handling
+- venue-adjusted and opponent-adjusted baselines
+- score-state materialization (`runs_before_ball`, `wickets_before_ball`, `balls_remaining`)
+- player role labels (batter / bowler / all-rounder / keeper)
+- match-quality and opposition-strength adjustments
 
-explicit super-over handling
+---
 
-venue-adjusted and opponent-adjusted baselines
+## 26. Change Log
 
-score-state materialization (runs_before_ball, wickets_before_ball, balls_remaining)
+**v1.0**
 
-player role labels (batter / bowler / all-rounder / keeper)
-
-match-quality and opposition-strength adjustments
-
-26. Change Log
-v1.0
-
-Initial repo-ready rules spec
-
-Added canonical formulas
-
-Added dismissal and grouping rules
-
-Added all-rounder ranking framework
-
-Added NL2SQL policy guidance
-
-
+- Initial repo-ready rules spec
+- Added canonical formulas
+- Added dismissal and grouping rules
+- Added all-rounder ranking framework
+- Added NL2SQL policy guidance
