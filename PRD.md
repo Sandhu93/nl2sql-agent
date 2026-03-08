@@ -565,6 +565,8 @@ class QueryResponse(BaseModel):
 | Phase 5 | Smart table selection from CSV descriptions               | ✅ Done   |
 | Phase 6 | Conversation memory + query rewriting                     | ✅ Done   |
 | Phase 7 | LLM fallback chain (Claude, Gemini, DeepSeek, Ollama)     | ✅ Done   |
+| Phase 7.5 | Cricket domain knowledge RAG (cricket_rules.md + cricket_knowledge.py + 15 few-shot examples + ICC all-rounder formula) | ✅ Done |
+| Phase 7.6 | Load testing (Locust) + production hardening (timeout, 429 handling, Gemini model fix) | ✅ Done |
 
 ### Planned Phases
 
@@ -700,7 +702,7 @@ Phase 12 (Auth)      ──── independent, can run in parallel
 
 | Metric                              | Current (v1)  | Target (v2)         |
 |--------------------------------------|---------------|---------------------|
-| Query accuracy (correct SQL)         | ~85%          | ~90% (more examples)|
+| Query accuracy (correct SQL)         | ~90% (with cricket RAG + 15 examples) | ~95% (Phase 8+)|
 | Avg response time — single query     | ~3s           | < 5s (with insights)|
 | User engagement — follow-up rate     | N/A           | 30%+ click follow-up chips |
 | Viz requests served successfully     | N/A           | > 90%               |

@@ -792,3 +792,174 @@ Layer 1 violations return **HTTP 400** because the client sent bad input. Layer 
 - The API response shape `{answer, sql}` — unchanged
 - Conversation history — still updated even when SQL is blocked at Layer 3
 - `thread_id` wiring — unchanged
+
+---
+
+## Cricket Domain Knowledge Integration
+
+**Implemented after:** Aarti's Recommendation 2 (Query Validation)
+
+**Goal:** Give the LLM accurate cricket domain knowledge (metric formulas, dismissal logic, aggregation grain rules, all-rounder ranking) so it generates cricket-correct SQL, not just schema-correct SQL.
+
+### The problem it solves
+
+After Step 6 (few-shot examples + conversation memory), the LLM could navigate the schema but had no cricket knowledge. It:
+- Counted wickets in `GROUP BY batsman` queries (bug #19 — everyone gets 1 wicket)
+- Counted ducks at ball level instead of innings level (bug #20 — RG Sharma = 239 ducks)
+- Miscounted batting average outs using `player_dismissed IS NOT NULL` inside `GROUP BY batsman` (bug #21 — inflated outs count)
+
+### Solution: RAG over cricket_rules.md
+
+Instead of a knowledge graph (overkill for ~30 stable concepts), we added a lightweight ChromaDB RAG pipeline that retrieves the most relevant domain rules for each incoming query.
+
+### New file: `backend/app/cricket_rules.md`
+
+A canonical cricket statistics specification (~1300 lines, 26 sections) covering:
+
+| Section | Content |
+|---|---|
+| §5 | Mandatory derived columns (balls_faced, legal_balls, runs_conceded formula) |
+| §7 | Dismissal attribution rules — positive IN list for bowler wickets |
+| §8 | Batting rules — GROUP BY batsman, outs formula, batting average two-CTE pattern |
+| §9 | Bowling rules — GROUP BY bowler, economy formula, NEVER batsman |
+| §10 | Fielding rules — wicket_fielders table, GROUP BY fielder_name |
+| §12 | Eligibility (min balls_faced, min legal_balls) |
+| §16.7 | ICC-style all-rounder match-points formula (canonical) |
+| §21 | Innings-level aggregation rules (ducks, half-centuries, batting average grain) |
+| §23 | Minimal SQL examples (economy, fielding, powerplay, all-rounder V2) |
+
+Chunking strategy: split at `## ` heading boundaries so each retrieved chunk is a complete, self-contained section.
+
+### New file: `backend/app/cricket_knowledge.py`
+
+```python
+# Lazy singleton — built on first request, reused forever
+_vectorstore: Chroma | None = None
+
+def _get_vectorstore() -> Chroma:
+    # reads cricket_rules.md, chunks by ## headings,
+    # embeds via OpenAIEmbeddings, stores in ChromaDB collection "cricket_rules"
+    ...
+
+async def retrieve_cricket_rules(question: str, k: int = 3) -> str:
+    # returns k=3 most relevant sections joined with "---" separators
+    # try/except: never blocks pipeline on failure (returns "")
+    ...
+```
+
+### Change to `agent.py` — parallel retrieval
+
+**Before:** table selection was a sequential step.
+
+**After:** table selection and cricket retrieval run in parallel via `asyncio.gather`:
+
+```python
+raw_selection, cricket_context = await asyncio.gather(
+    select_table.ainvoke({"question": standalone_question}),
+    retrieve_cricket_rules(standalone_question, k=3),
+)
+```
+
+This hides retrieval latency (one embedding API call + in-memory vector search) behind the table selection LLM call. Net wall-clock cost: zero.
+
+### Change to `prompts.py` — `{cricket_context}` in system prompt
+
+Added `{cricket_context}` variable to the system prompt, populated per-request with the retrieved domain rules:
+
+```python
+system_prompt = (
+    "...KEY SCHEMA RULES:\n"
+    "...\n\n"
+    "Relevant cricket domain rules for this query:\n{cricket_context}\n\n"
+    "Relevant table schema:\n{table_info}\n\n"
+    "Here are the most relevant example questions and their SQL queries:"
+)
+```
+
+### Few-shot example upgrades
+
+Also upgraded `IPL_EXAMPLES` to reinforce cricket-correct patterns:
+
+| Old count | New count | Key additions |
+|---|---|---|
+| 8 static examples | 15 dynamic (k=3) | allrounders (ICC-style), economy, fielding, powerplay, ducks, half-centuries, batting average |
+
+The allrounder example went through three major iterations:
+1. Simple two-CTE (runs + wickets, `total_runs + total_wickets * 20` — abandoned)
+2. Four-metric par-value formula (batting_avg/30 + SR/150) × (W/24/2 + economy_bonus)
+3. **Final**: ICC-style match-points — per-match batting/bowling points, normalized to 0–1000, averaged per season, `AllRounderIndex = bat_rating * bowl_rating / 1000`
+
+### Prompt-level domain rules (system prompt KEY SCHEMA RULES)
+
+Added critical rules directly to the system prompt (always present, not RAG-dependent):
+
+```
+- Batting stats: GROUP BY batsman on deliveries
+- Bowling stats: GROUP BY bowler on deliveries (NEVER batsman)
+- Fielding stats: query wicket_fielders table (NOT deliveries)
+- season is VARCHAR; use year INTEGER for numeric filtering
+- INNINGS-LEVEL STATS (ducks, half-centuries, centuries, batting average):
+  ALWAYS aggregate to per-innings level first, NEVER at ball level
+- BATTING AVERAGE outs: COUNT by player_dismissed, NOT player_dismissed IS NOT NULL inside GROUP BY batsman
+```
+
+### What does NOT change
+
+- `IPL_EXAMPLES` selection mechanism (k=3 ChromaDB similarity) — unchanged
+- The `_generate_query` singleton chain — unchanged (just receives new `cricket_context` arg)
+- SQL cleaning, retry loop, rephrase — unchanged
+- The API response shape — unchanged
+
+---
+
+## Load Testing
+
+**Implemented after:** Cricket Domain Knowledge Integration
+
+**Goal:** Validate system behaviour under concurrent load and identify production bottlenecks.
+
+### Tool: Locust
+
+Created `scripts/locustfile.py` with weighted task distribution:
+
+| Task | Weight | Example question |
+|---|---|---|
+| Simple queries | 3 | "How many runs did Virat Kohli score?" |
+| Aggregation queries | 3 | "Top 5 run scorers across all seasons?" |
+| Multi-table queries | 2 | "How many sixes in 2016?" |
+| Innings-level queries | 1 | "Which batsmen have the most ducks?" |
+| Conversation chains | 2 | 3-turn conversations |
+| Invalid queries | 1 | Empty string (expects 422) |
+| Health checks | 5 | GET /health |
+
+### Round 1 — 3 users, 60 seconds (baseline)
+
+- Aggregation queries: avg ~5.8s
+- Simple queries: avg ~6s
+- Multi-table queries: avg ~10.6s
+- Health endpoint: ~3ms
+- 1 expected failure (422 on empty string)
+
+### Round 2 — 10 users, 10 minutes (stress test)
+
+Findings:
+- Response times degraded to 300–310 seconds on some requests
+- 5 total failures
+- **Root cause 1**: OpenAI GPT-4o hitting 30k TPM limit → 429 rate limit cascading into retry storms
+- **Root cause 2**: Gemini fallback (`gemini-1.5-pro`) returns 404 (model removed) → LangChain retries with unbounded exponential backoff (up to 5+ min per request)
+- **Root cause 3**: OpenAI 429 returned as HTTP 500 to client — no back-pressure signal
+
+### Fixes applied (Bug #22)
+
+| Fix | Where |
+|---|---|
+| `gemini-1.5-pro` → `gemini-2.0-flash`, `max_retries=2` | `agent.py` |
+| 60s `asyncio.wait_for` timeout → HTTP 504 | `routes/query.py` |
+| Explicit `RateLimitError` catch → HTTP 429 | `routes/query.py` |
+
+### Still pending
+
+- `slowapi` per-IP rate limiting (20 req/min on `/api/query`)
+- Semaphore to cap concurrent LLM calls (prevent TPM storms)
+- Response caching for repeated identical questions
+- Circuit breaker pattern per LLM provider
