@@ -4,6 +4,8 @@ A production-ready full-stack application that answers natural-language question
 about an IPL (Indian Premier League) cricket database by generating and executing
 PostgreSQL queries, powered by **LangChain**, **FastAPI**, and **Next.js 14**.
 
+**Dataset**: [IPL Cricket Dataset (2008–2025) — PostgreSQL](https://www.kaggle.com/datasets/sandeepbkadam/ipl-cricket-dataset-20082025-postgresql)
+
 ```
 nl2sql_agent/
 ├── backend/
