@@ -1,5 +1,6 @@
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
+from typing import Any
 import logging
 
 import asyncio
@@ -23,6 +24,12 @@ class QueryRequest(BaseModel):
 class QueryResponse(BaseModel):
     answer: str
     sql: str
+    # Phase 8 — Insight generation layer (always present on successful queries)
+    insights: dict[str, Any] | None = None
+    # Phase 9 — Visualization layer (only present when user asks for a chart)
+    # TODO: When the MCP chart server is wired up, this field will be populated
+    #       by the MCP tool response rather than the LLM viz_agent.
+    chart_spec: dict[str, Any] | None = None
 
 
 @router.post(
@@ -76,4 +83,9 @@ async def query_endpoint(body: QueryRequest) -> QueryResponse:
             detail="An error occurred while processing your request.",
         ) from exc
 
-    return QueryResponse(answer=result["answer"], sql=result["sql"])
+    return QueryResponse(
+        answer=result["answer"],
+        sql=result["sql"],
+        insights=result.get("insights"),
+        chart_spec=result.get("chart_spec"),
+    )

@@ -1,11 +1,17 @@
 "use client";
 
-import { useState, useRef, useEffect, FormEvent } from "react";
+import { useState, useRef, useEffect, FormEvent, useCallback } from "react";
 import ChatMessage, { Message } from "@/components/ChatMessage";
 import { queryAgent } from "@/lib/api";
 
 /**
  * Main chat page — NL2SQL Agent interface.
+ *
+ * Phase 8: Assistant messages now carry `insights` (key_takeaway +
+ *          follow_up_chips).  Clicking a chip pre-fills the input and submits.
+ *
+ * Phase 9: Assistant messages carry `chart_spec` when the user asked for a
+ *          chart — rendered inline by ChartBlock via ChatMessage.
  *
  * TODO: Connect the real LangGraph backend by ensuring `queryAgent` in
  *       lib/api.ts points to the correct NEXT_PUBLIC_BACKEND_URL and the
@@ -24,48 +30,82 @@ export default function ChatPage() {
   const [error, setError] = useState<string | null>(null);
 
   const bottomRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
 
   // Auto-scroll to the latest message
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, loading]);
 
-  async function handleSubmit(e: FormEvent<HTMLFormElement>) {
-    e.preventDefault();
-    const question = input.trim();
-    if (!question || loading) return;
+  /**
+   * Submit the current input as a question.
+   * Extracted so it can be called from both the form and chip clicks.
+   */
+  const submitQuestion = useCallback(
+    async (question: string) => {
+      if (!question.trim() || loading) return;
 
-    const userMessage: Message = {
-      id: crypto.randomUUID(),
-      role: "user",
-      content: question,
-    };
-
-    setMessages((prev) => [...prev, userMessage]);
-    setInput("");
-    setError(null);
-    setLoading(true);
-
-    try {
-      // TODO: Replace with streaming once the backend supports SSE.
-      const response = await queryAgent({ question, thread_id: threadId });
-
-      const assistantMessage: Message = {
+      const userMessage: Message = {
         id: crypto.randomUUID(),
-        role: "assistant",
-        content: response.answer,
-        sql: response.sql,
+        role: "user",
+        content: question.trim(),
       };
 
-      setMessages((prev) => [...prev, assistantMessage]);
-    } catch (err) {
-      const message =
-        err instanceof Error ? err.message : "An unexpected error occurred.";
-      setError(message);
-    } finally {
-      setLoading(false);
-    }
+      setMessages((prev) => [...prev, userMessage]);
+      setInput("");
+      setError(null);
+      setLoading(true);
+
+      try {
+        // TODO: Replace with streaming once the backend supports SSE.
+        const response = await queryAgent({
+          question: question.trim(),
+          thread_id: threadId,
+        });
+
+        const assistantMessage: Message = {
+          id: crypto.randomUUID(),
+          role: "assistant",
+          content: response.answer,
+          sql: response.sql,
+          // Phase 8 — insights
+          insights: response.insights,
+          // Phase 9 — chart spec (null when not a viz request)
+          chart_spec: response.chart_spec,
+        };
+
+        setMessages((prev) => [...prev, assistantMessage]);
+      } catch (err) {
+        const message =
+          err instanceof Error ? err.message : "An unexpected error occurred.";
+        setError(message);
+      } finally {
+        setLoading(false);
+      }
+    },
+    [loading, threadId]
+  );
+
+  async function handleSubmit(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    await submitQuestion(input);
   }
+
+  /**
+   * Phase 8 — chip click handler.
+   * Pre-fills the input textarea with the chip question and focuses it,
+   * then submits immediately so the user gets an instant follow-up answer.
+   */
+  const handleChipClick = useCallback(
+    (question: string) => {
+      setInput(question);
+      // Submit after state update settles
+      setTimeout(() => {
+        submitQuestion(question);
+      }, 0);
+    },
+    [submitQuestion]
+  );
 
   return (
     <main className="flex flex-col h-full max-w-4xl mx-auto px-4">
@@ -90,7 +130,11 @@ export default function ChatPage() {
         )}
 
         {messages.map((msg) => (
-          <ChatMessage key={msg.id} message={msg} />
+          <ChatMessage
+            key={msg.id}
+            message={msg}
+            onChipClick={handleChipClick}
+          />
         ))}
 
         {/* Loading indicator */}
@@ -127,6 +171,7 @@ export default function ChatPage() {
       <footer className="py-4 border-t border-gray-800 flex-shrink-0">
         <form onSubmit={handleSubmit} className="flex gap-3 items-end">
           <textarea
+            ref={inputRef}
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => {

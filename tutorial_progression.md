@@ -963,3 +963,87 @@ Findings:
 - Semaphore to cap concurrent LLM calls (prevent TPM storms)
 - Response caching for repeated identical questions
 - Circuit breaker pattern per LLM provider
+
+---
+
+## Phase 8 — Insight Generation Layer
+
+**Branch:** `feature/insight-visualization`
+
+**Goal:** Make every answer feel like a data analyst response — not just the raw answer, but a "so what?" takeaway and suggested next questions.
+
+### New file: `backend/app/insights_agent.py`
+
+Runs in parallel with `rephrase_answer` via `asyncio.gather`.  Produces:
+- `key_takeaway` — one sentence highlighting the most interesting finding
+- `follow_up_chips` — 3 short follow-up questions answerable from the IPL database
+
+```python
+answer, insights, chart_spec = await asyncio.gather(
+    rephrase_answer.ainvoke({...}),
+    generate_insights(standalone_question, result, _llm),
+    _maybe_chart(),
+)
+```
+
+Failures are silent — exceptions return `{"key_takeaway": "", "follow_up_chips": []}` so the main answer is never blocked.
+
+### API response change
+
+`QueryResponse` now includes:
+```json
+{
+  "answer": "...",
+  "sql": "...",
+  "insights": {
+    "key_takeaway": "Virat Kohli leads with 7,263 runs, 1,400 ahead of second place.",
+    "follow_up_chips": [
+      "Who scored the most runs in 2023?",
+      "What is Kohli's batting average?",
+      "Which team has the most run scorers in the top 10?"
+    ]
+  },
+  "chart_spec": null
+}
+```
+
+### Frontend changes
+
+- `InsightsCard.tsx` — renders the key takeaway + follow-up chips below the answer
+- Chips are clickable buttons: clicking pre-fills the input and auto-submits
+- `ChatMessage.tsx` — passes `onChipClick` prop through to InsightsCard
+- `page.tsx` — `handleChipClick` sets input + calls `submitQuestion`
+
+---
+
+## Phase 9 — Visualization Layer
+
+**Branch:** `feature/insight-visualization`
+
+**Goal:** Let users ask for charts inline — "show me a bar chart of top run scorers" renders a Vega-Lite chart directly in the chat.
+
+### Trigger
+
+`wants_visualization(question)` in `viz_agent.py` — regex match against keywords:
+`chart`, `graph`, `plot`, `visualize`, `visualization`, `bar chart`, `line chart`, `pie chart`, `scatter`, `histogram`
+
+### New file: `backend/app/viz_agent.py`
+
+When triggered, calls the LLM with the question + SQL result string and asks it to produce a Vega-Lite v5 JSON spec.
+
+Runs as the third parallel task in `asyncio.gather` alongside rephrase + insights.  Returns `None` (and logs a warning) on any failure.
+
+**MCP-ready abstraction:** The function body has a `TODO` comment showing exactly how the LLM call would be replaced by an MCP chart-server tool call for deterministic, schema-validated specs.
+
+### Frontend changes
+
+- `ChartBlock.tsx` — renders a Vega-Lite spec using `vega-embed` (dynamic import to avoid SSR)
+- `package.json` — added `vega`, `vega-lite`, `vega-embed`
+- Chart appears above the InsightsCard in the message bubble
+
+### What does NOT change
+
+- Main pipeline steps 0–4 — unchanged
+- Error handling / retry loop — unchanged
+- Conversation history — unchanged
+- API response shape for non-viz queries (chart_spec is null) — no breaking change

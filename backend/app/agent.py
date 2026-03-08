@@ -50,9 +50,11 @@ from langchain_openai import ChatOpenAI
 
 from app.config import get_settings
 from app.cricket_knowledge import retrieve_cricket_rules
+from app.insights_agent import generate_insights
 from app.prompts import _build_few_shot_prompt
 from app.sql_helpers import _clean_sql, _is_sql_error, _run_sql, validate_sql
 from app.table_selector import get_table_details, get_table_names
+from app.viz_agent import generate_chart_spec, wants_visualization
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -363,7 +365,12 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
                    can reference earlier answers in the same session.
 
     Returns:
-        {"answer": <natural language sentence>, "sql": <clean SQL>}
+        {
+            "answer":     natural language sentence,
+            "sql":        clean SQL string,
+            "insights":   {"key_takeaway": str, "follow_up_chips": list[str]},
+            "chart_spec": Vega-Lite spec dict or None (only when viz was requested),
+        }
     """
     logger.info("run_agent | thread_id=%s | question=%r", thread_id, question)
 
@@ -387,8 +394,13 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
     # On the first turn (empty history) we skip the LLM call entirely — there
     # is nothing to resolve and we save one round-trip.
     if history.messages:
+        # Cap history sent to the rewrite chain at the last 2 turns (4 messages).
+        # The rewrite LLM only needs recent context (e.g. "What about 2020?") —
+        # passing the full accumulated history causes GPT-4o to read cricket stats
+        # from earlier AI answers and "answer" instead of "rewrite" the question.
+        rewrite_history = history.messages[-4:]
         standalone_question: str = await rewrite_query.ainvoke({
-            "history": history.messages,
+            "history": rewrite_history,
             "question": question,
         })
         # Safety guard: if the rewriter produced a statement instead of a question
@@ -470,7 +482,7 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
         )
         history.add_user_message(question)
         history.add_ai_message(answer)
-        return {"answer": answer, "sql": sql}
+        return {"answer": answer, "sql": sql, "insights": None, "chart_spec": None}
 
     # Step 4 — Execute with automatic error correction on failure.
     # IMPORTANT: QuerySQLDataBaseTool never raises on SQL errors — it returns
@@ -511,7 +523,7 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
         logger.warning("Returning error answer | thread_id=%s", thread_id)
         history.add_user_message(question)
         history.add_ai_message(answer)
-        return {"answer": answer, "sql": sql}
+        return {"answer": answer, "sql": sql, "insights": None, "chart_spec": None}
 
     if not result or not result.strip():
         answer = (
@@ -522,14 +534,40 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
         logger.warning("Empty query result | thread_id=%s | sql=%s", thread_id, sql)
         history.add_user_message(question)
         history.add_ai_message(answer)
-        return {"answer": answer, "sql": sql}
+        return {"answer": answer, "sql": sql, "insights": None, "chart_spec": None}
 
-    answer: str = await rephrase_answer.ainvoke({
-        "question": standalone_question,
-        "query": sql,
-        "result": result,
-    })
+    # Steps 5a + 5b + 5c — run in parallel to hide LLM latency:
+    #   5a. rephrase_answer  — convert raw DB rows into a natural language sentence
+    #   5b. generate_insights — key takeaway + 3 follow-up question chips (Phase 8)
+    #   5c. generate_chart_spec — Vega-Lite spec if user asked for a chart (Phase 9)
+    #
+    # TODO: If insights or viz add too much latency, gate them behind
+    #       ENABLE_INSIGHTS / ENABLE_VIZ config flags in config.py.
+    viz_requested = wants_visualization(standalone_question)
+
+    async def _maybe_chart() -> dict | None:
+        """Run chart spec generation only when the question asks for a viz."""
+        if not viz_requested:
+            return None
+        return await generate_chart_spec(standalone_question, result, _llm)
+
+    answer, insights, chart_spec = await asyncio.gather(
+        rephrase_answer.ainvoke({
+            "question": standalone_question,
+            "query": sql,
+            "result": result,
+        }),
+        generate_insights(standalone_question, result, _llm),
+        _maybe_chart(),
+    )
     logger.info("Rephrased answer: %s", answer)
+    logger.info(
+        "Insights generated | key_takeaway=%r | chips=%d",
+        insights.get("key_takeaway", "")[:60],
+        len(insights.get("follow_up_chips", [])),
+    )
+    if chart_spec:
+        logger.info("Chart spec generated | viz_requested=%s", viz_requested)
 
     # Update conversation history so the next turn in this session can
     # reference what was asked and answered here.
@@ -541,4 +579,4 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
         len(history.messages) // 2,
     )
 
-    return {"answer": answer, "sql": sql}
+    return {"answer": answer, "sql": sql, "insights": insights, "chart_spec": chart_spec}
