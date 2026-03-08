@@ -89,8 +89,8 @@ IPL_EXAMPLES = [
         "query": (
             "SELECT COUNT(*) AS total_sixes "
             "FROM deliveries d "
-            "JOIN matches m ON d.match_id = m.id "
-            "WHERE m.season = 2016 "
+            "JOIN matches m ON d.match_id = m.match_id "
+            "WHERE m.year = 2016 "
             "  AND d.batsman_runs = 6;"
         ),
     },
@@ -212,6 +212,16 @@ def _build_few_shot_prompt() -> ChatPromptTemplate:
                     "Only query columns that exist in the schema below. Pay attention to "
                     "which table each column belongs to. Wrap column and table names in "
                     "double quotes only when they are reserved words.\n\n"
+                    "KEY SCHEMA RULES:\n"
+                    "- The primary key of the matches table is 'match_id' (NOT 'id').\n"
+                    "- Join deliveries to matches using: ON deliveries.match_id = matches.match_id\n"
+                    "- 'season' in matches is a VARCHAR string (e.g. '2017', '2019/20'). "
+                    "For numeric year filtering, use the 'year' INTEGER column instead "
+                    "(e.g. WHERE year = 2019).\n"
+                    "- Batting stats (runs, strike rate): GROUP BY batsman on deliveries.\n"
+                    "- Bowling stats (wickets, economy): GROUP BY bowler on deliveries.\n"
+                    "- Fielding stats (catches, run-outs): query the wicket_fielders table, "
+                    "NOT deliveries.\n\n"
                     "Relevant table schema:\n{table_info}\n\n"
                     "Here are the most relevant example questions and their SQL queries:"
                 ),

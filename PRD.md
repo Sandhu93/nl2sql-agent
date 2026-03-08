@@ -5,7 +5,7 @@
 | **Product Name** | NL2SQL IPL Cricket Agent                   |
 | **Version**      | 2.0 (planned)                              |
 | **Status**       | Draft                                      |
-| **Last Updated** | 2026-03-07                                 |
+| **Last Updated** | 2026-03-08                                 |
 
 ---
 

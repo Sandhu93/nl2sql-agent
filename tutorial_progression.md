@@ -210,7 +210,7 @@ Raw LLM output
 | Top wicket-takers | `dismissal_kind NOT IN (…)`, `player_dismissed IS NOT NULL` |
 | Most IPL titles | `WHERE match_type = 'Final'`, `winner` |
 | Player of the Match awards | `player_of_match`, `COUNT(*)` |
-| Sixes in a season | `JOIN matches ON match_id`, `season`, `batsman_runs = 6` |
+| Sixes in a season | `JOIN matches ON match_id`, `year` (integer), `batsman_runs = 6` |
 | Highest individual score in a match | `GROUP BY batsman, match_id` |
 | Most-used venue | `venue`, `matches_hosted` |
 
@@ -333,7 +333,7 @@ from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
 ### The problem with full-schema prompts
 
-Every call to `create_sql_query_chain` injects the complete schema of every table (column names, types, sample rows) into the prompt. With 2 tables this is fine; with 100+ tables it:
+Every call to `create_sql_query_chain` injects the complete schema of every table (column names, types, sample rows) into the prompt. With 9 tables this is manageable; with 100+ tables it:
 - Pushes token costs up dramatically on every request
 - Floods the model with irrelevant schema, reducing accuracy
 - Slows response time as the prompt grows
