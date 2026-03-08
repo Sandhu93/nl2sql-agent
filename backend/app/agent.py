@@ -36,6 +36,7 @@ Pipeline
   + history updated        ← original question + answer stored per-thread
 """
 
+import asyncio
 import logging
 from typing import List
 
@@ -48,6 +49,7 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder, Prom
 from langchain_openai import ChatOpenAI
 
 from app.config import get_settings
+from app.cricket_knowledge import retrieve_cricket_rules
 from app.prompts import _build_few_shot_prompt
 from app.sql_helpers import _clean_sql, _is_sql_error, _run_sql, validate_sql
 from app.table_selector import get_table_details, get_table_names
@@ -408,13 +410,22 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
     else:
         standalone_question = question  # first turn — nothing to resolve
 
-    # Step 1 — Identify which tables are relevant to this question.
-    # The selector reads plain-English table descriptions and asks the LLM to
-    # pick only the tables needed, so the SQL-generation prompt is focused.
-    # Fallback to all available tables if the selector returns nothing so that
-    # SQL generation always has a schema to work with.
+    # Steps 1 + 1b — Run table selection and cricket knowledge retrieval in
+    # parallel. Both are independent of each other: table selection makes one
+    # LLM API call; cricket retrieval makes one embedding API call + in-memory
+    # vector search. Running them concurrently saves ~300–500 ms per request.
+    #
+    # TODO: If the cricket vector store is not yet initialised when the first
+    #       request arrives, its cold-start embedding call also runs here,
+    #       hidden inside asyncio.gather. That is intentional — the user's first
+    #       question absorbs the one-time cost transparently.
     available_tables = set(_db.get_usable_table_names())
-    raw_selection: List[str] = await select_table.ainvoke({"question": standalone_question})
+    raw_selection, cricket_context = await asyncio.gather(
+        select_table.ainvoke({"question": standalone_question}),
+        retrieve_cricket_rules(standalone_question, k=3),
+    )
+
+    # Step 1 — Validate table selection; fall back to all tables if needed.
     # Discard hallucinated names; keep only tables that actually exist in the DB.
     table_names = [t for t in raw_selection if t in available_tables]
     if not table_names:
@@ -422,14 +433,17 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
         logger.warning("Table selector returned no valid tables; falling back to all: %s", table_names)
     logger.info("Tables selected: %s", table_names)
 
-    # Step 2 — Generate SQL using only the selected tables' schemas.
-    # history.messages injects prior (HumanMessage, AIMessage) turns into the
-    # MessagesPlaceholder so the model can resolve follow-up references like
-    # "and what about in 2017?" or "who was the runner-up?".
+    # Step 2 — Generate SQL using the selected tables' schemas + cricket context.
+    # {cricket_context} carries the k=3 most relevant sections from
+    # cricket_rules.md (e.g. bowling rules, eligibility rules, dismissal logic)
+    # so the LLM generates cricket-correct SQL, not just schema-correct SQL.
+    # history.messages injects prior (HumanMessage, AIMessage) turns so the
+    # model can resolve follow-up references like "and what about in 2017?".
     raw: str = await generate_query.ainvoke({
         "question": standalone_question,
         "table_names_to_use": table_names,
         "messages": history.messages,
+        "cricket_context": cricket_context,
     })
     logger.info("Raw LLM output: %s", raw)
 

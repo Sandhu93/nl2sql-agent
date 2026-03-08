@@ -697,6 +697,100 @@ FinalScore =
 
 ---
 
+### 16.7 ICC-Style Match-Points Formula (Canonical — use this for all-rounder queries)
+
+This is the preferred formula for SQL generation. It approximates the official ICC all-rounder
+index without requiring opposition strength or pitch-context data.
+
+**Batting match points (per innings):**
+
+```
+BattingPts =
+  12 * LN(1 + runs)
+  + 8 * not_out_flag
+  + 10 * clamp((player_sr / match_sr) - 1, -0.4, 0.6)
+  + 4  if team won AND runs >= 30
+  + 2  if team won AND runs >= 15
+```
+
+Where:
+- `player_sr = runs / balls_faced`  (runs per ball)
+- `match_sr  = inn_runs / bat_balls` (inning-level runs per ball; `bat_balls` excludes wides)
+- Not-out detection: `BOOL_AND(player_dismissed IS DISTINCT FROM batsman)` across all deliveries for that batsman in the match
+
+**Bowling match points (per match spell):**
+
+```
+BowlingPts =
+  22 * wickets + 6 * LN(1 + wickets)
+  + 18 * clamp((match_econ / player_econ) - 1, -0.5, 0.8)
+  + 4  * min(legal_balls / 24, 1)
+  + 4  if team won AND wickets >= 2
+  + 2  if team won AND player_econ < match_econ
+```
+
+Where:
+- `player_econ = runs_conceded / legal_balls` (runs per ball; `runs_conceded` excludes byes/leg-byes)
+- `match_econ  = inn_runs / bowl_balls` (inning-level runs per ball; `bowl_balls` excludes wides and no-balls)
+- Bowler dismissal kinds: positive IN list only — `'bowled','caught','caught and bowled','lbw','stumped','hit wicket'`
+- If `runs_conceded = 0`, use clamp maximum (`0.8`) — perfect economy earns max bonus
+
+**Season rating (normalised):**
+
+```
+MatchRating     = LEAST(1000, GREATEST(0, 300 + 8 * MatchPts))
+SeasonRating    = AVG(MatchRating)  -- average across all matches in window
+```
+
+**All-rounder index:**
+
+```
+AllRounderIndex = BattingRating * BowlingRating / 1000
+```
+
+Product is zero if either dimension is zero — a pure batsman or pure bowler cannot rank as an all-rounder.
+
+**Eligibility:**
+- `total_balls_faced >= 60` (minimum batting volume)
+- `total_legal_balls_bowled >= 60` (minimum bowling volume)
+
+**Key SQL patterns for this formula:**
+
+```sql
+-- Inning context (needed for SR and economy adjustment)
+inning_ctx AS (
+    SELECT match_id, batting_team,
+        SUM(total_runs)                                        AS inn_runs,
+        COUNT(*) FILTER (WHERE NOT is_wide)                    AS bat_balls,
+        COUNT(*) FILTER (WHERE NOT is_wide AND NOT is_no_ball) AS bowl_balls
+    FROM deliveries
+    GROUP BY match_id, batting_team
+)
+
+-- Not-out detection (batting CTE)
+BOOL_AND(player_dismissed IS DISTINCT FROM batsman) AS not_out
+
+-- SR adjustment
+10.0 * GREATEST(-0.4, LEAST(0.6,
+    CASE WHEN bat_balls > 0 AND balls_faced > 0
+         THEN (runs::float / balls_faced) / (inn_runs::float / bat_balls) - 1.0
+         ELSE 0.0 END))
+
+-- Economy adjustment
+18.0 * GREATEST(-0.5, LEAST(0.8,
+    CASE WHEN bowl_balls > 0 AND legal_balls > 0
+         THEN CASE WHEN runs_conceded = 0 THEN 0.8
+                   ELSE (inn_runs::float / bowl_balls)
+                        / (runs_conceded::float / legal_balls) - 1.0
+              END
+         ELSE 0.0 END))
+
+-- Season rating aggregation
+AVG(LEAST(1000.0, GREATEST(0.0, 300.0 + 8.0 * (... match_pts ...)))) AS bat_rating
+```
+
+---
+
 ## 17. Context Adjustment Rules
 
 ### 17.1 Batting Phase Baseline
@@ -933,6 +1027,352 @@ WHERE b.balls_faced >= 60
   AND bw.legal_balls >= 60;
 ```
 
+### 23.5 Production-Grade All-Rounder Ranking (V2, Windowed)
+
+This is the canonical all-rounder ranking query. It implements the §16 scoring
+framework (percentile normalization → batting score → bowling score → harmonic
+mean balance → reliability factor → final score) over any configurable match window.
+
+**How to set the window via the `params` CTE:**
+
+| Goal | year_from | year_to | date_from | date_to | last_n_matches |
+|---|---|---|---|---|---|
+| Single season (2025) | 2025 | 2025 | NULL | NULL | NULL |
+| Multiple seasons (2024–2025) | 2024 | 2025 | NULL | NULL | NULL |
+| Date range | NULL | NULL | DATE '2025-03-01' | DATE '2025-05-31' | NULL |
+| Last N matches overall | NULL | NULL | NULL | NULL | 5 |
+| Last N matches in 2025 | 2025 | 2025 | NULL | NULL | 5 |
+| All-time | NULL | NULL | NULL | NULL | NULL |
+
+**Note on `batting_average_proxy` when outs = 0:** treated as 999.0 (very high average)
+rather than division by zero, so not-out players rank high on this metric as intended.
+
+```sql
+WITH params AS (
+    SELECT
+        NULL::int  AS year_from,
+        NULL::int  AS year_to,
+        NULL::date AS date_from,
+        NULL::date AS date_to,
+        NULL::int  AS last_n_matches,
+        5::int     AS min_matches,
+        4::int     AS min_batting_innings,
+        4::int     AS min_bowling_innings,
+        60::int    AS min_balls_faced,
+        60::int    AS min_legal_balls
+),
+
+filtered_matches AS (
+    SELECT
+        m.*,
+        ROW_NUMBER() OVER (
+            ORDER BY m.date DESC NULLS LAST, m.match_id DESC
+        ) AS recent_rn
+    FROM matches m
+    CROSS JOIN params p
+    WHERE (p.year_from IS NULL OR m.year >= p.year_from)
+      AND (p.year_to   IS NULL OR m.year <= p.year_to)
+      AND (p.date_from IS NULL OR m.date >= p.date_from)
+      AND (p.date_to   IS NULL OR m.date <= p.date_to)
+),
+
+scoped_matches AS (
+    SELECT fm.*
+    FROM filtered_matches fm
+    CROSS JOIN params p
+    WHERE p.last_n_matches IS NULL
+       OR fm.recent_rn <= p.last_n_matches
+),
+
+player_match_presence AS (
+    SELECT DISTINCT match_id, player
+    FROM (
+        SELECT px.match_id, px.player_name AS player
+        FROM playing_xi px
+        JOIN scoped_matches sm ON sm.match_id = px.match_id
+        UNION
+        SELECT r.match_id, r.player_in AS player
+        FROM replacements r
+        JOIN scoped_matches sm ON sm.match_id = r.match_id
+        WHERE r.player_in IS NOT NULL
+        UNION
+        SELECT d.match_id, d.batsman AS player
+        FROM deliveries d
+        JOIN scoped_matches sm ON sm.match_id = d.match_id
+        WHERE d.batsman IS NOT NULL
+        UNION
+        SELECT d.match_id, d.non_striker AS player
+        FROM deliveries d
+        JOIN scoped_matches sm ON sm.match_id = d.match_id
+        WHERE d.non_striker IS NOT NULL
+        UNION
+        SELECT d.match_id, d.bowler AS player
+        FROM deliveries d
+        JOIN scoped_matches sm ON sm.match_id = d.match_id
+        WHERE d.bowler IS NOT NULL
+        UNION
+        SELECT d.match_id, d.player_dismissed AS player
+        FROM deliveries d
+        JOIN scoped_matches sm ON sm.match_id = d.match_id
+        WHERE d.player_dismissed IS NOT NULL
+        UNION
+        SELECT wf.match_id, wf.fielder_name AS player
+        FROM wicket_fielders wf
+        JOIN scoped_matches sm ON sm.match_id = wf.match_id
+        WHERE wf.fielder_name IS NOT NULL
+    ) x
+),
+
+matches_played AS (
+    SELECT player, COUNT(DISTINCT match_id) AS matches_played
+    FROM player_match_presence
+    GROUP BY player
+),
+
+window_size AS (
+    SELECT COUNT(*)::int AS total_matches FROM scoped_matches
+),
+
+batting_match_balls AS (
+    SELECT
+        d.match_id,
+        d.batsman AS player,
+        SUM(COALESCE(d.batsman_runs, 0)) AS runs,
+        COUNT(*) FILTER (WHERE COALESCE(d.is_wide, false) = false) AS balls_faced
+    FROM deliveries d
+    JOIN scoped_matches sm ON sm.match_id = d.match_id
+    WHERE d.batsman IS NOT NULL
+    GROUP BY d.match_id, d.batsman
+),
+
+batting_match_outs AS (
+    SELECT
+        d.match_id,
+        d.player_dismissed AS player,
+        COUNT(*) FILTER (
+            WHERE d.player_dismissed IS NOT NULL
+              AND COALESCE(d.dismissal_kind, '') <> 'retired hurt'
+        ) AS outs
+    FROM deliveries d
+    JOIN scoped_matches sm ON sm.match_id = d.match_id
+    WHERE d.player_dismissed IS NOT NULL
+    GROUP BY d.match_id, d.player_dismissed
+),
+
+batting_match AS (
+    SELECT
+        COALESCE(b.match_id, o.match_id) AS match_id,
+        COALESCE(b.player,   o.player)   AS player,
+        COALESCE(b.runs, 0)              AS runs,
+        COALESCE(b.balls_faced, 0)       AS balls_faced,
+        COALESCE(o.outs, 0)              AS outs,
+        CASE
+            WHEN COALESCE(b.balls_faced, 0) > 0 OR COALESCE(o.outs, 0) > 0 THEN 1
+            ELSE 0
+        END AS batting_innings
+    FROM batting_match_balls b
+    FULL OUTER JOIN batting_match_outs o
+      ON b.match_id = o.match_id AND b.player = o.player
+),
+
+batting_window AS (
+    SELECT
+        player,
+        COUNT(*) FILTER (WHERE batting_innings = 1)    AS batting_innings,
+        SUM(runs)                                       AS runs,
+        SUM(balls_faced)                                AS balls_faced,
+        SUM(outs)                                       AS outs,
+        AVG(runs::numeric) FILTER (WHERE batting_innings = 1) AS runs_per_innings,
+        CASE
+            WHEN SUM(outs) > 0
+            THEN SUM(runs)::numeric / SUM(outs)
+            ELSE 999.0  -- treat never-dismissed record as very high average
+        END AS batting_average_proxy,
+        CASE
+            WHEN SUM(balls_faced) > 0
+            THEN 100.0 * SUM(runs)::numeric / SUM(balls_faced)
+            ELSE 0
+        END AS strike_rate
+    FROM batting_match
+    GROUP BY player
+),
+
+bowling_match AS (
+    SELECT
+        d.match_id,
+        d.bowler AS player,
+        COUNT(*) FILTER (
+            WHERE COALESCE(d.is_wide, false) = false
+              AND COALESCE(d.is_no_ball, false) = false
+        ) AS legal_balls,
+        SUM(
+            COALESCE(d.batsman_runs, 0) +
+            CASE
+                WHEN COALESCE(d.is_wide, false) = true
+                  OR COALESCE(d.is_no_ball, false) = true
+                THEN COALESCE(d.extras, 0)
+                ELSE 0
+            END
+        ) AS runs_conceded,
+        COUNT(*) FILTER (
+            WHERE COALESCE(d.dismissal_kind, '') IN (
+                'bowled', 'caught', 'caught and bowled',
+                'lbw', 'stumped', 'hit wicket'
+            )
+        ) AS wickets,
+        COUNT(*) FILTER (
+            WHERE COALESCE(d.is_wide, false) = false
+              AND COALESCE(d.is_no_ball, false) = false
+              AND (COALESCE(d.batsman_runs, 0) + COALESCE(d.extras, 0)) = 0
+        ) AS dot_balls
+    FROM deliveries d
+    JOIN scoped_matches sm ON sm.match_id = d.match_id
+    WHERE d.bowler IS NOT NULL
+    GROUP BY d.match_id, d.bowler
+),
+
+bowling_window AS (
+    SELECT
+        player,
+        COUNT(*) FILTER (WHERE legal_balls > 0) AS bowling_innings,
+        SUM(legal_balls)    AS legal_balls,
+        SUM(runs_conceded)  AS runs_conceded,
+        SUM(wickets)        AS wickets,
+        SUM(dot_balls)      AS dot_balls,
+        CASE
+            WHEN SUM(legal_balls) > 0
+            THEN 6.0 * SUM(runs_conceded)::numeric / SUM(legal_balls)
+            ELSE NULL
+        END AS economy,
+        CASE
+            WHEN SUM(wickets) > 0
+            THEN SUM(legal_balls)::numeric / SUM(wickets)
+            ELSE NULL
+        END AS bowling_strike_rate,
+        CASE
+            WHEN SUM(legal_balls) > 0
+            THEN 24.0 * SUM(wickets)::numeric / SUM(legal_balls)
+            ELSE 0
+        END AS wickets_per_24_balls,
+        CASE
+            WHEN SUM(legal_balls) > 0
+            THEN 100.0 * SUM(dot_balls)::numeric / SUM(legal_balls)
+            ELSE 0
+        END AS dot_ball_pct
+    FROM bowling_match
+    GROUP BY player
+),
+
+candidates AS (
+    SELECT
+        mp.player,
+        mp.matches_played,
+        bwin.total_matches,
+        bw.batting_innings,  bw.runs,         bw.balls_faced,
+        bw.outs,             bw.runs_per_innings,
+        bw.batting_average_proxy,              bw.strike_rate,
+        bo.bowling_innings,  bo.legal_balls,   bo.runs_conceded,
+        bo.wickets,          bo.dot_balls,     bo.economy,
+        bo.bowling_strike_rate, bo.wickets_per_24_balls, bo.dot_ball_pct
+    FROM matches_played mp
+    JOIN batting_window  bw   ON bw.player = mp.player
+    JOIN bowling_window  bo   ON bo.player = mp.player
+    CROSS JOIN window_size bwin
+    CROSS JOIN params p
+    WHERE mp.matches_played  >= p.min_matches
+      AND bw.batting_innings >= p.min_batting_innings
+      AND bo.bowling_innings >= p.min_bowling_innings
+      AND bw.balls_faced     >= p.min_balls_faced
+      AND bo.legal_balls     >= p.min_legal_balls
+),
+
+normalized AS (
+    SELECT
+        c.*,
+        100.0 * PERCENT_RANK() OVER (ORDER BY c.runs_per_innings)          AS pct_runs_per_innings,
+        100.0 * PERCENT_RANK() OVER (ORDER BY c.batting_average_proxy)     AS pct_batting_average,
+        100.0 * PERCENT_RANK() OVER (ORDER BY c.strike_rate)               AS pct_strike_rate,
+        100.0 * PERCENT_RANK() OVER (ORDER BY c.wickets_per_24_balls)      AS pct_wkts_per_24,
+        100.0 * PERCENT_RANK() OVER (ORDER BY c.economy DESC NULLS LAST)   AS pct_inv_economy,
+        100.0 * PERCENT_RANK() OVER (ORDER BY c.bowling_strike_rate DESC NULLS LAST) AS pct_inv_bowling_sr,
+        100.0 * PERCENT_RANK() OVER (ORDER BY c.dot_ball_pct)              AS pct_dot_ball_pct
+    FROM candidates c
+),
+
+scores AS (
+    SELECT
+        n.*,
+        (0.35 * n.pct_runs_per_innings +
+         0.30 * n.pct_batting_average  +
+         0.35 * n.pct_strike_rate)          AS batting_score,
+        (0.35 * n.pct_wkts_per_24       +
+         0.30 * n.pct_inv_economy       +
+         0.20 * n.pct_inv_bowling_sr    +
+         0.15 * n.pct_dot_ball_pct)         AS bowling_score
+    FROM normalized n
+),
+
+final_rankings AS (
+    SELECT
+        s.*,
+        CASE
+            WHEN (s.batting_score + s.bowling_score) > 0
+            THEN 2.0 * s.batting_score * s.bowling_score
+                 / (s.batting_score + s.bowling_score)
+            ELSE 0
+        END AS balance_score,
+        SQRT(
+            LEAST(1.0, s.balls_faced::numeric / 120.0) *
+            LEAST(1.0, s.legal_balls::numeric / 120.0)
+        ) AS reliability_factor
+    FROM scores s
+)
+
+SELECT
+    RANK() OVER (
+        ORDER BY
+            (0.35 * batting_score + 0.35 * bowling_score +
+             0.30 * CASE WHEN (batting_score + bowling_score) > 0
+                         THEN 2.0 * batting_score * bowling_score
+                              / (batting_score + bowling_score)
+                         ELSE 0 END
+            ) * (0.85 + 0.15 * reliability_factor) DESC,
+            balance_score DESC,
+            bowling_score DESC,
+            batting_score DESC,
+            matches_played DESC,
+            player ASC
+    ) AS rank_in_window,
+
+    player,
+    total_matches AS matches_in_selected_window,
+    matches_played,
+    batting_innings,
+    bowling_innings,
+    runs,
+    balls_faced,
+    ROUND(batting_average_proxy, 2)   AS batting_average,
+    ROUND(strike_rate, 2)             AS strike_rate,
+    wickets,
+    legal_balls,
+    ROUND(economy, 2)                 AS economy,
+    ROUND(bowling_strike_rate, 2)     AS bowling_strike_rate,
+    ROUND(wickets_per_24_balls, 2)    AS wickets_per_24_balls,
+    ROUND(dot_ball_pct, 2)            AS dot_ball_pct,
+    ROUND(batting_score, 2)           AS batting_score,
+    ROUND(bowling_score, 2)           AS bowling_score,
+    ROUND(balance_score, 2)           AS balance_score,
+    ROUND(reliability_factor, 3)      AS reliability_factor,
+    ROUND(
+        (0.35 * batting_score + 0.35 * bowling_score + 0.30 * balance_score)
+        * (0.85 + 0.15 * reliability_factor),
+        2
+    ) AS final_score
+FROM final_rankings
+ORDER BY rank_in_window
+LIMIT 5;
+```
+
 ---
 
 ## 24. NL2SQL Policy Summary
@@ -946,7 +1386,7 @@ When generating cricket SQL:
 - apply correct dismissal attribution
 - apply eligibility rules before ranking
 - avoid arbitrary heuristics unless explicitly labeled as rough
-- for all-rounders, use batting quality + bowling quality + balance
+- for all-rounders, use the ICC-style match-points formula (§16.7): batting_rating * bowling_rating / 1000
 
 ---
 

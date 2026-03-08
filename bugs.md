@@ -494,10 +494,10 @@ sql_to_run = await _fix_sql(sql_to_run, question, result, table_names)
 
 ## #19 — Allrounder query: LLM counts wickets from `batsman` column instead of `bowler` column
 
-**Status: OPEN — not yet fully resolved**
+**Status: RESOLVED**
 
 **Symptom**
-When asking *"Who are the best allrounders in IPL history?"*, the results are either wrong (everyone showing 1 wicket) or the `rephrase_answer` chain says "the data cannot be determined" instead of presenting the rows. Example bad SQL:
+When asking *"Who are the best allrounders in IPL history?"*, the results were either wrong (everyone showing 1 wicket) or the `rephrase_answer` chain said "the data cannot be determined" instead of presenting the rows. Example bad SQL:
 
 ```sql
 SELECT
@@ -524,71 +524,29 @@ Without a teaching example, it conflates them into a single GROUP BY on `batsman
 **Secondary symptom: `rephrase_answer` critiquing results**
 Even when the corrected CTE SQL ran successfully, `rephrase_answer` sometimes said "this cannot be determined" or audited the SQL instead of presenting the data. The LLM was treating the result rows as input for analysis rather than as the answer.
 
-**Attempts so far**
+**Fix — multi-pronged approach**
 
-### Attempt 1 — Added allrounder few-shot example to `IPL_EXAMPLES` (in `prompts.py`)
+### Fix 1 — Tightened `rephrase_answer` prompt with explicit RULES (in `agent.py`)
 
-Added a 9th example teaching the correct two-CTE pattern:
+The prompt was rewritten to prevent the LLM from critiquing or auditing the SQL result. This fixed the secondary symptom.
 
-```python
-{
-    "input": "Who are the best allrounders in IPL history?",
-    "query": (
-        "WITH batting AS (\n"
-        "    SELECT batsman AS player, SUM(batsman_runs) AS total_runs\n"
-        "    FROM deliveries\n"
-        "    GROUP BY batsman\n"
-        "),\n"
-        "bowling AS (\n"
-        "    SELECT bowler AS player, COUNT(*) AS total_wickets\n"
-        "    FROM deliveries\n"
-        "    WHERE dismissal_kind NOT IN ('run out', 'retired hurt', 'obstructing the field')\n"
-        "      AND player_dismissed IS NOT NULL\n"
-        "    GROUP BY bowler\n"
-        ")\n"
-        "SELECT bat.player, bat.total_runs, bowl.total_wickets\n"
-        "FROM batting bat\n"
-        "JOIN bowling bowl ON bat.player = bowl.player\n"
-        "WHERE bat.total_runs >= 500 AND bowl.total_wickets >= 20\n"
-        "ORDER BY (bat.total_runs + bowl.total_wickets * 20) DESC\n"
-        "LIMIT 10;"
-    ),
-},
-```
+### Fix 2 — Iteratively improved allrounder few-shot example (in `prompts.py`)
 
-**Expected**: The semantic similarity selector will surface this example when allrounder-type questions are asked, steering the model to use `GROUP BY bowler` for wickets.
+Multiple iterations culminating in a full ICC-style match-points formula using `inning_ctx` CTE for context, `BOOL_AND(player_dismissed IS DISTINCT FROM batsman)` for not-out detection, separate `m_bat` (GROUP BY batsman) and `m_bowl` (GROUP BY bowler) CTEs, and `AllRounderIndex = batting_rating * bowling_rating / 1000`.
 
-**Result**: Not yet confirmed as fixed — issue still open at time of writing.
+The final formula:
+- Batting: `AVG(LEAST(1000, GREATEST(0, 300 + 8 * (12*LN(1+runs) + 8*not_out + 10*SR_adj + result_bonus))))`
+- Bowling: `AVG(LEAST(1000, GREATEST(0, 300 + 8 * (22*wkts + 6*LN(1+wkts) + 18*econ_adj + 4*workload + result_bonus))))`
+- Index: `bat_rating * bowl_rating / 1000`
 
-### Attempt 2 — Tightened `rephrase_answer` prompt with explicit RULES (in `agent.py`)
+### Fix 3 — Cricket Domain Knowledge RAG (cricket_knowledge.py + cricket_rules.md)
 
-The prompt was rewritten to prevent the LLM from critiquing or auditing the SQL result:
+Added `backend/app/cricket_rules.md` — a comprehensive specification (~1300 lines) covering metric formulas, dismissal attribution, phase definitions, SQL generation rules, eligibility, ranking logic (including the ICC-style formula in §16.7), and SQL examples.
 
-```python
-answer_prompt = PromptTemplate.from_template(
-    """You are given a user question, the SQL query that was run, and the SQL result rows.
-Your job is to write a clear, concise natural-language answer based ONLY on the SQL result.
+Added `backend/app/cricket_knowledge.py` — loads `cricket_rules.md`, splits it into chunks at `## ` heading boundaries, embeds each chunk via OpenAI embeddings, stores in ChromaDB. `retrieve_cricket_rules(question, k=3)` retrieves the 3 most relevant sections for each query and injects them into the SQL-generation system prompt as `{cricket_context}`.
 
-RULES:
-1. Present the data from the SQL result as the answer — do NOT question whether the query is correct.
-2. Do NOT critique, analyse, or explain the SQL.
-3. Do NOT say the answer "cannot be determined" if data is present — use what the result gives you.
-4. If the result is a list of rows, present them clearly (e.g. as bullet points or a ranked list).
+### Fix 4 — System prompt `KEY SCHEMA RULES` block (in `prompts.py`)
 
-Question: {question}
-SQL Query: {query}
-SQL Result: {result}
-Answer: """
-)
-```
+Added explicit schema rules to the system prompt covering: `GROUP BY batsman` for batting, `GROUP BY bowler` for bowling, `wicket_fielders` table for fielding, `year` vs `season` column distinction.
 
-**Expected**: Prevents `rephrase_answer` from saying "cannot be determined" when result rows are present.
-
-**Result**: Addresses the secondary symptom but does not fix the root cause (wrong SQL generation).
-
-**What still needs to be tried**
-
-- Verify in Docker logs whether the new few-shot example is being selected by the semantic similarity selector for allrounder questions (look for which 3 examples are chosen at query time).
-- If the example is not being selected, consider adding it as a static (always-included) prefix in the system prompt instead of relying on the similarity selector.
-- Add a system prompt instruction explicitly stating the GROUP BY rule: *"To count bowling wickets, always GROUP BY bowler — never by batsman."*
-- Consider a post-generation validation step that checks if a "wickets" column is computed from a `GROUP BY batsman` clause and rejects it before execution.
+**Result**: Allrounder queries now correctly use separate CTEs with proper GROUP BY, dismissal kind positive IN list, and ICC-style balanced ranking. Verified against IPL 2025 — SP Narine, HH Pandya, RA Jadeja appear in top 5 as expected.
