@@ -244,3 +244,97 @@ Sub-title: `IPL Cricket Database · FastAPI + Next.js · GPT-4o + ChromaDB + Pos
        └──────────────────────────────────────────┘
                           answer displayed in chat UI
 ```
+
+---
+
+## Mermaid Version
+
+Paste into [mermaid.live](https://mermaid.live) to render.
+
+```mermaid
+flowchart LR
+    User(["User"])
+
+    subgraph FE["Frontend — Next.js  port 8085"]
+        ChatUI["Chat UI\nthread_id session"]
+    end
+
+    subgraph BE["FastAPI Backend — port 8086"]
+        direction TB
+        API["POST /api/query\nroutes/query.py\n60s timeout · 429 handling"]
+        Guardrail["Guardrail Agent\ninput_validator.py\nmax 500 chars · injection check · DDL block"]
+        Rewrite["Rewrite Agent\nagent.py · Step 0\nrewrites follow-ups into standalone questions"]
+
+        subgraph PAR["asyncio.gather — runs in parallel"]
+            direction LR
+            TableSel["Table Selector Agent\ntable_selector.py\nLLM picks relevant tables"]
+            CricketKnow["Cricket Knowledge Agent\ncricket_knowledge.py\nChromaDB similarity search · k=3"]
+        end
+
+        SQLAgent["SQL Agent\nprompts.py · Step 2\nNL to SQL · k=3 few-shot · cricket context"]
+        ValidSQL["validate_sql\nsql_helpers.py · Layer 3\nmust start SELECT or WITH · no DDL"]
+        ExecSQL["Execute SQL\nsql_helpers.py · Step 4\nQuerySQLDataBaseTool · errors as strings"]
+        FixSQL["Fix SQL Agent\nagent.py · _fix_sql\nLLM rewrites using error message · max 2 retries"]
+        Analysis["Analysis Agent\nagent.py · Step 5\nrephrase_answer · raw result to natural language"]
+        History["Conversation History\nin-memory · dict keyed by thread_id"]
+    end
+
+    subgraph KS["Knowledge Stores — ChromaDB"]
+        direction TB
+        ChromaFS["Few-Shot Examples\n15 IPL patterns · k=3 similarity"]
+        ChromaCR["Cricket Rules\ncricket_rules.md · k=3 similarity"]
+    end
+
+    subgraph LLMs["LLM Providers"]
+        direction TB
+        GPT4o["GPT-4o\nPrimary"]
+        Fallbacks["Claude · Gemini 2.0 Flash\nDeepSeek · Ollama\nFallback Chain"]
+    end
+
+    DB[("PostgreSQL\nipl_db\n9 tables · 278k rows")]
+
+    %% Main request flow
+    User --> ChatUI
+    ChatUI -->|HTTP POST + thread_id| API
+    API --> Guardrail
+    Guardrail -->|HTTP 400 rejected| User
+    Guardrail -->|valid| Rewrite
+    Rewrite --> TableSel
+    Rewrite --> CricketKnow
+    TableSel -->|table names| SQLAgent
+    CricketKnow -->|cricket context| SQLAgent
+    SQLAgent --> ValidSQL
+    ValidSQL -->|HTTP 200 SQL blocked| User
+    ValidSQL -->|valid SQL| ExecSQL
+    ExecSQL -->|error string| FixSQL
+    FixSQL -->|corrected SQL| ExecSQL
+    ExecSQL -->|results| Analysis
+    Analysis --> History
+    History -->|answer + sql| ChatUI
+
+    %% External calls — dashed lines
+    TableSel -.->|table description lookup| ChromaFS
+    SQLAgent -.->|k=3 examples| ChromaFS
+    CricketKnow -.->|k=3 rules| ChromaCR
+    SQLAgent -.->|generate SQL| GPT4o
+    Rewrite -.->|rewrite question| GPT4o
+    FixSQL -.->|fix SQL| GPT4o
+    Analysis -.->|rephrase answer| GPT4o
+    GPT4o -.->|on failure| Fallbacks
+    ExecSQL -.->|SQL query| DB
+
+    %% Styling
+    classDef agent      fill:#AED6F1,stroke:#2E86C1,color:#000
+    classDef exec       fill:#A9DFBF,stroke:#27AE60,color:#000
+    classDef knowledge  fill:#FEF9E7,stroke:#F39C12,color:#000
+    classDef llm        fill:#E8DAEF,stroke:#8E44AD,color:#000
+    classDef storage    fill:#F9E79F,stroke:#E67E22,color:#000
+    classDef ui         fill:#FDFEFE,stroke:#5D6D7E,color:#000
+
+    class Guardrail,Rewrite,TableSel,CricketKnow,SQLAgent,Analysis agent
+    class ExecSQL,FixSQL exec
+    class ChromaFS,ChromaCR knowledge
+    class GPT4o,Fallbacks llm
+    class DB storage
+    class ChatUI,API,History ui
+```
