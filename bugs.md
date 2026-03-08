@@ -629,3 +629,32 @@ Added batting average example (#15) using the two-CTE pattern: `batting_runs` CT
 ### Fix 3 — System prompt rule in prompts.py
 Added to KEY SCHEMA RULES:
 - "BATTING AVERAGE: outs must be counted by player_dismissed (who got out), NOT by counting player_dismissed IS NOT NULL inside GROUP BY batsman. Use separate CTEs: runs GROUP BY batsman, outs GROUP BY player_dismissed, then JOIN on player name."
+
+---
+
+## #22 — Gemini Fallback Infinite Retry Loop + Missing Rate Limit Handling
+
+**Symptom**
+Load testing with 10 concurrent users caused requests to hang for 310+ seconds (5+ minutes) before eventually returning HTTP 500. Docker logs showed continuous Gemini 404 retries with exponential backoff (2s → 4s → 8s → 16s → 32s → 60s → 60s...) that never resolved.
+
+**Root cause**
+Two compounding issues:
+
+1. **Wrong Gemini model name**: `gemini-1.5-pro` was configured as the fallback but has been removed from Google's API (`v1beta`). Every call returns a 404 `NotFound`. LangChain's `ChatGoogleGenerativeAI` treats this as a retryable error and uses aggressive exponential backoff with no max-retry cap — a single request retried for 5+ minutes on a permanently dead endpoint.
+
+2. **No rate limit differentiation**: When OpenAI returned 429 (TPM limit: 30,000 tokens/min), the `openai.RateLimitError` was caught by the generic `except Exception` handler and returned as HTTP 500 — giving the client no signal to back off. The fallback chain also exacerbated the problem by piling Gemini retry loops on top of OpenAI retries.
+
+3. **No request timeout**: There was no upper bound on how long a single `/api/query` request could run. The Gemini retry loop could block a request indefinitely.
+
+**Fix**
+### Fix 1 — Updated Gemini model name in `agent.py`
+Changed `gemini-1.5-pro` → `gemini-2.0-flash` and added `max_retries=2` to prevent infinite retry loops on permanent errors.
+
+### Fix 2 — Request timeout in `routes/query.py`
+Wrapped `run_agent()` in `asyncio.wait_for(timeout=60)`. Requests that exceed 60 seconds now return HTTP 504 with a clear timeout message instead of hanging.
+
+### Fix 3 — Rate limit error handling in `routes/query.py`
+Added explicit `except RateLimitError` handler that returns HTTP 429 (not 500) with a "please wait" message, giving clients proper back-pressure signals.
+
+### Fix 4 — Updated Locust test
+Updated `locustfile.py` to track 429 and 504 responses separately in reporting.

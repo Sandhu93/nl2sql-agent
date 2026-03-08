@@ -103,9 +103,10 @@ def _build_llm_with_fallbacks() -> ChatOpenAI:
             from langchain_google_genai import ChatGoogleGenerativeAI  # pip install langchain-google-genai
             fallbacks.append(
                 ChatGoogleGenerativeAI(
-                    model="gemini-1.5-pro",
+                    model="gemini-2.0-flash",
                     temperature=0,
                     google_api_key=settings.google_api_key,
+                    max_retries=2,
                 )
             )
             logger.info("Fallback LLM registered: Google Gemini")
