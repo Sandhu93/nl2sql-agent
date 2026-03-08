@@ -658,3 +658,63 @@ Added explicit `except RateLimitError` handler that returns HTTP 429 (not 500) w
 
 ### Fix 4 — Updated Locust test
 Updated `locustfile.py` to track 429 and 504 responses separately in reporting.
+
+---
+
+## #23 — Rewrite chain hallucinating answers from conversation history
+
+**Symptom**
+After 3+ turns in a session, the query rewrite chain occasionally outputs a full answer (e.g. `"The top 5 run scorers in IPL history are:\n\n- V Kohli: 7263 runs\n..."`) instead of a reformulated question. The safety guard catches it (output doesn't end with `?`), falls back to the original question, and the pipeline continues correctly — but an LLM call is wasted, and the numbers in the hallucinated answer are wrong (7263 vs actual 8671 for Kohli).
+
+Docker log:
+```
+WARNING | app.agent | Query rewrite produced a non-question — falling back to original.
+rewrite='The top 5 run scorers in IPL history are:\n\n- V Kohli: 7263 runs\n- S Dhawan: 6617 runs...'
+```
+
+**Root cause**
+The full `history.messages` list was passed to the rewrite chain. After several turns, AI messages in the history contain entire cricket stat tables. GPT-4o reads those stats and generates an answer rather than reformulating the question — even though the system prompt says "only rewrite, never answer". With growing history (6+ turns, 12 messages), the accumulated data overwhelms the instruction.
+
+**Fix**
+Cap the history sent to the rewrite chain at the last 2 turns (4 messages). The rewrite chain only needs recent context to resolve references like "What about 2020?" — passing the full accumulated history is both unnecessary and harmful:
+
+```python
+# Before
+standalone_question = await rewrite_query.ainvoke({
+    "history": history.messages,
+    "question": question,
+})
+
+# After — cap at last 2 turns (4 messages)
+rewrite_history = history.messages[-4:]
+standalone_question = await rewrite_query.ainvoke({
+    "history": rewrite_history,
+    "question": question,
+})
+```
+
+---
+
+## #24 — Player name mismatch: full names fail in playing_xi / deliveries queries
+
+**Symptom**
+"In which teams did he [Rohit Sharma] play in IPL?" → rewrite correctly resolves to "In which teams did Rohit Sharma play in the IPL?" but the generated SQL uses `WHERE player_name = 'Rohit Sharma'` on `playing_xi`, which returns empty results.
+
+Docker log:
+```
+INFO  | app.agent | Query result:
+WARNING | app.agent | Empty query result | sql=SELECT DISTINCT team FROM playing_xi WHERE player_name = 'Rohit Sharma' LIMIT 5;
+```
+
+**Root cause**
+Player names in `deliveries` (batsman/bowler), `playing_xi`, and `wicket_fielders` are stored in abbreviated form (`'RG Sharma'`, `'V Kohli'`). The `players` table holds both `player_name` (abbreviated) and `player_full_name` (full). When the rewrite chain resolves a pronoun to a full name like "Rohit Sharma", the LLM uses that full name directly in the query without joining `players` — the mismatch silently returns zero rows with no SQL error.
+
+**Fix**
+Two-layer fix:
+
+### Fix 1 — System prompt rule in prompts.py
+Added to KEY SCHEMA RULES:
+- "PLAYER NAMES: player names in deliveries, playing_xi, and wicket_fielders are abbreviated (e.g. 'RG Sharma'). When searching by full/common name, join with the players table: `JOIN players ON players.player_name = <col>` and filter by `players.player_full_name ILIKE '%name%'`."
+
+### Fix 2 — Few-shot example in prompts.py
+Added example #16 "Which IPL teams did Rohit Sharma play for?" demonstrating the `playing_xi JOIN players` pattern with `player_full_name ILIKE '%Rohit Sharma%'`.

@@ -13,9 +13,23 @@ export interface QueryRequest {
   thread_id: string;
 }
 
+/** Phase 8 — key takeaway + follow-up question chips */
+export interface Insights {
+  key_takeaway: string;
+  follow_up_chips: string[];
+}
+
 export interface QueryResponse {
   answer: string;
   sql: string;
+  /** Phase 8 — present on every successful query */
+  insights: Insights | null;
+  /**
+   * Phase 9 — Vega-Lite v5 spec, only present when the user asked for a chart.
+   * TODO: Will be sourced from the MCP chart server once wired up.
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  chart_spec: Record<string, any> | null;
 }
 
 /**

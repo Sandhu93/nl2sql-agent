@@ -1,9 +1,18 @@
 "use client";
 
 import SqlBlock from "./SqlBlock";
+import InsightsCard from "./InsightsCard";
+import ChartBlock from "./ChartBlock";
+import { Insights } from "@/lib/api";
 
 /**
  * ChatMessage — renders a single turn in the conversation.
+ *
+ * Phase 8: Renders an InsightsCard below the answer for assistant messages
+ *          that have insights (key_takeaway + follow_up_chips).
+ *
+ * Phase 9: Renders a ChartBlock below the insights when a chart_spec is
+ *          present (i.e. the user asked for a chart).
  *
  * TODO: Extend this component to support streaming responses once the
  *       backend supports SSE / streaming.
@@ -15,13 +24,23 @@ export interface Message {
   content: string;
   /** Present only on assistant messages that include a generated SQL query. */
   sql?: string;
+  /** Phase 8 — insight data returned by the backend insights_agent. */
+  insights?: Insights | null;
+  /**
+   * Phase 9 — Vega-Lite v5 spec, only present when the user asked for a chart.
+   * TODO: Will be sourced from MCP chart server once wired up.
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  chart_spec?: Record<string, any> | null;
 }
 
 interface ChatMessageProps {
   message: Message;
+  /** Called when the user clicks a follow-up chip — pre-fills the input. */
+  onChipClick?: (question: string) => void;
 }
 
-export default function ChatMessage({ message }: ChatMessageProps) {
+export default function ChatMessage({ message, onChipClick }: ChatMessageProps) {
   const isUser = message.role === "user";
 
   return (
@@ -39,7 +58,22 @@ export default function ChatMessage({ message }: ChatMessageProps) {
         <p className="text-sm leading-relaxed whitespace-pre-wrap break-words">
           {message.content}
         </p>
+
+        {/* SQL block — existing */}
         {!isUser && message.sql && <SqlBlock sql={message.sql} />}
+
+        {/* Phase 9 — chart rendered before insights so the data leads */}
+        {!isUser && message.chart_spec && (
+          <ChartBlock spec={message.chart_spec} />
+        )}
+
+        {/* Phase 8 — insights + follow-up chips */}
+        {!isUser && message.insights && onChipClick && (
+          <InsightsCard
+            insights={message.insights}
+            onChipClick={onChipClick}
+          />
+        )}
       </div>
     </div>
   );
