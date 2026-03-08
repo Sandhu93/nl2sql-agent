@@ -291,6 +291,92 @@ IPL_EXAMPLES = [
             "LIMIT 10;"
         ),
     },
+    # Duck pattern — teaches the model that:
+    #   - a duck is an INNINGS-LEVEL outcome (total runs = 0 AND dismissed)
+    #   - must aggregate to per-innings level FIRST (GROUP BY match_id, inning, batsman)
+    #   - then count innings where runs = 0 and the player was dismissed
+    #   - NEVER count at ball level (batsman_runs = 0 AND dismissal_kind IS NOT NULL)
+    #   - player_dismissed identifies who got out, not batsman (run-outs can dismiss non-striker)
+    #   - exclude 'retired hurt' from dismissals
+    {
+        "input": "Which batsmen have the most ducks in IPL history?",
+        "query": (
+            "WITH batting_innings AS (\n"
+            "    SELECT match_id, inning, batsman AS player,\n"
+            "        SUM(batsman_runs) AS runs\n"
+            "    FROM deliveries\n"
+            "    GROUP BY match_id, inning, batsman\n"
+            "),\n"
+            "dismissals AS (\n"
+            "    SELECT match_id, inning, player_dismissed AS player\n"
+            "    FROM deliveries\n"
+            "    WHERE player_dismissed IS NOT NULL\n"
+            "      AND dismissal_kind <> 'retired hurt'\n"
+            "    GROUP BY match_id, inning, player_dismissed\n"
+            ")\n"
+            "SELECT bi.player, COUNT(*) AS ducks\n"
+            "FROM batting_innings bi\n"
+            "JOIN dismissals ds\n"
+            "  ON ds.match_id = bi.match_id\n"
+            " AND ds.inning   = bi.inning\n"
+            " AND ds.player   = bi.player\n"
+            "WHERE bi.runs = 0\n"
+            "GROUP BY bi.player\n"
+            "ORDER BY ducks DESC\n"
+            "LIMIT 10;"
+        ),
+    },
+    # Innings milestone pattern — teaches the model that:
+    #   - half-centuries (50-99 runs) and centuries (100+) are innings-level outcomes
+    #   - must aggregate to per-innings level FIRST, then filter
+    #   - same pattern applies to: ducks, golden ducks, centuries, highest scores
+    {
+        "input": "Which players have scored the most half-centuries in IPL?",
+        "query": (
+            "WITH innings_scores AS (\n"
+            "    SELECT match_id, inning, batsman AS player,\n"
+            "        SUM(batsman_runs) AS runs\n"
+            "    FROM deliveries\n"
+            "    GROUP BY match_id, inning, batsman\n"
+            ")\n"
+            "SELECT player, COUNT(*) AS half_centuries\n"
+            "FROM innings_scores\n"
+            "WHERE runs BETWEEN 50 AND 99\n"
+            "GROUP BY player\n"
+            "ORDER BY half_centuries DESC\n"
+            "LIMIT 10;"
+        ),
+    },
+    # Batting average pattern — teaches the model that:
+    #   - outs must be counted by player_dismissed (who got out), NOT by batsman (who was striking)
+    #   - on run-outs, the non-striker can be dismissed while a different player is batsman
+    #   - use TWO separate CTEs: runs grouped by batsman, outs grouped by player_dismissed
+    #   - join on player name to get correct per-player average
+    #   - NEVER use COUNT(*) FILTER (WHERE player_dismissed IS NOT NULL) in GROUP BY batsman
+    {
+        "input": "Who has the highest batting average in IPL history?",
+        "query": (
+            "WITH batting_runs AS (\n"
+            "    SELECT batsman AS player, SUM(batsman_runs) AS total_runs\n"
+            "    FROM deliveries\n"
+            "    GROUP BY batsman\n"
+            "),\n"
+            "batting_outs AS (\n"
+            "    SELECT player_dismissed AS player, COUNT(*) AS outs\n"
+            "    FROM deliveries\n"
+            "    WHERE player_dismissed IS NOT NULL\n"
+            "      AND dismissal_kind <> 'retired hurt'\n"
+            "    GROUP BY player_dismissed\n"
+            ")\n"
+            "SELECT r.player, r.total_runs, o.outs,\n"
+            "    ROUND(r.total_runs::numeric / NULLIF(o.outs, 0), 2) AS batting_average\n"
+            "FROM batting_runs r\n"
+            "JOIN batting_outs o ON o.player = r.player\n"
+            "WHERE o.outs > 0\n"
+            "ORDER BY batting_average DESC\n"
+            "LIMIT 10;\n"
+        ),
+    },
 ]
 
 
@@ -375,7 +461,14 @@ def _build_few_shot_prompt() -> ChatPromptTemplate:
         "- Batting stats (runs, strike rate): GROUP BY batsman on deliveries.\n"
         "- Bowling stats (wickets, economy): GROUP BY bowler on deliveries.\n"
         "- Fielding stats (catches, run-outs): query the wicket_fielders table, "
-        "NOT deliveries.\n\n"
+        "NOT deliveries.\n"
+        "- INNINGS-LEVEL STATS (ducks, half-centuries, centuries, batting average): "
+        "ALWAYS aggregate to per-innings level first (GROUP BY match_id, inning, batsman), "
+        "then count/filter at the innings level. NEVER count these at ball level.\n"
+        "- BATTING AVERAGE: outs must be counted by player_dismissed (who got out), "
+        "NOT by counting player_dismissed IS NOT NULL inside GROUP BY batsman. "
+        "Use separate CTEs: runs GROUP BY batsman, outs GROUP BY player_dismissed, "
+        "then JOIN on player name.\n\n"
         "Relevant cricket domain rules for this query:\n{cricket_context}\n\n"
         "Relevant table schema:\n{table_info}\n\n"
         "Here are the most relevant example questions and their SQL queries:"

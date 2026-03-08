@@ -550,3 +550,82 @@ Added `backend/app/cricket_knowledge.py` — loads `cricket_rules.md`, splits it
 Added explicit schema rules to the system prompt covering: `GROUP BY batsman` for batting, `GROUP BY bowler` for bowling, `wicket_fielders` table for fielding, `year` vs `season` column distinction.
 
 **Result**: Allrounder queries now correctly use separate CTEs with proper GROUP BY, dismissal kind positive IN list, and ICC-style balanced ranking. Verified against IPL 2025 — SP Narine, HH Pandya, RA Jadeja appear in top 5 as expected.
+
+---
+
+## #20 — Ducks / Innings-Level Stats Computed at Ball Level (Grain Mismatch)
+
+**Symptom**
+"Which batsmen have the most ducks?" → LLM generates:
+```sql
+SELECT batsman, COUNT(*) AS ducks
+FROM deliveries
+WHERE batsman_runs = 0 AND dismissal_kind IS NOT NULL
+GROUP BY batsman
+ORDER BY ducks DESC LIMIT 5;
+```
+Returns RG Sharma = 239, V Kohli = 224 — obviously impossible (real answer: GJ Maxwell = 19, RG Sharma = 18).
+
+**Root cause**
+The LLM counts at **ball level** (each delivery where runs=0 AND a dismissal occurred) instead of at **innings level** (total innings runs = 0 AND batter was dismissed). This is fundamentally wrong because:
+1. A batter can score 20 in an innings and get out on a ball with `batsman_runs = 0` — that's not a duck
+2. On run-outs the `batsman` column may differ from `player_dismissed` (non-striker dismissed)
+3. `COUNT(*)` on deliveries counts balls, not innings
+
+The same grain mismatch bug applies to: half-centuries, centuries, golden ducks, batting average, and any other stat that is an **innings outcome**, not a ball event.
+
+**Fix**
+Three-layer approach:
+
+### Fix 1 — Innings-level rules in cricket_rules.md (§21)
+Added Section 21 "Innings-Level Aggregation Rules" covering:
+- 21.1: Aggregation grain principle (always GROUP BY match_id, inning, batsman first)
+- 21.2: Duck definition + canonical SQL pattern (CTE-based)
+- 21.3–21.7: Golden duck, half-century, century, batting average, not-out detection
+- 21.8: Common mistakes to avoid (explicit "NEVER DO THIS" examples)
+
+Also added to §19 Mandatory Rules:
+- "Ducks, half-centuries, centuries, and batting average are innings-level outcomes — never compute them at ball level"
+- "Per-innings stats must GROUP BY match_id, inning, batsman before counting"
+
+### Fix 2 — Few-shot examples in prompts.py
+Added two new examples to `IPL_EXAMPLES`:
+- **Ducks pattern**: Full CTE-based query with `batting_innings` + `dismissals` CTEs joined to count innings where runs=0 AND dismissed
+- **Half-century pattern**: CTE aggregating per-innings runs, filtering `BETWEEN 50 AND 99`
+
+### Fix 3 — System prompt rule in prompts.py
+Added to KEY SCHEMA RULES:
+- "INNINGS-LEVEL STATS (ducks, half-centuries, centuries, batting average): ALWAYS aggregate to per-innings level first (GROUP BY match_id, inning, batsman), then count/filter at the innings level. NEVER count these at ball level."
+
+---
+
+## #21 — Batting Average Outs Miscounted (player_dismissed vs batsman)
+
+**Symptom**
+"Who has the highest batting average in IPL?" → LLM generates:
+```sql
+COUNT(*) FILTER (WHERE player_dismissed IS NOT NULL AND dismissal_kind <> 'retired hurt') AS outs
+... GROUP BY batsman
+```
+Returns Iqbal Abdulla = 88.00 (should be 44.00). Official IPL: Vivrant Sharma 69.00, MN van Wyk 55.66, B Sai Sudharsan ~49.8.
+
+**Root cause**
+The `outs` column counts ALL dismissals that occurred while the player was striker (`batsman`), NOT dismissals where the player themselves was out (`player_dismissed`). On run-outs, the non-striker can be dismissed while a different player is at the striker’s end. This inflates or deflates the outs count.
+
+Iqbal Abdulla has 88 runs and 2 career dismissals (average 44.00), but the wrong query counted only 1 dismissal event while he was striker, giving 88.00.
+
+**Fix**
+Three-layer approach:
+
+### Fix 1 — cricket_rules.md §8.3 + §21.6
+Rewrote the `outs` formula in §8.3 to require `player_dismissed = batsman` and added a "NEVER DO THIS" warning against `player_dismissed IS NOT NULL` inside `GROUP BY batsman`. Added canonical two-CTE SQL pattern for batting average (runs CTE grouped by `batsman`, outs CTE grouped by `player_dismissed`, joined on player name). Expanded §21.6 with the same pattern and explicit warning.
+
+Added to §19 Mandatory Rules:
+- "Batting outs must be counted by player_dismissed, never by counting player_dismissed IS NOT NULL inside GROUP BY batsman."
+
+### Fix 2 — Few-shot example in prompts.py
+Added batting average example (#15) using the two-CTE pattern: `batting_runs` CTE (GROUP BY batsman) + `batting_outs` CTE (GROUP BY player_dismissed), joined on player name.
+
+### Fix 3 — System prompt rule in prompts.py
+Added to KEY SCHEMA RULES:
+- "BATTING AVERAGE: outs must be counted by player_dismissed (who got out), NOT by counting player_dismissed IS NOT NULL inside GROUP BY batsman. Use separate CTEs: runs GROUP BY batsman, outs GROUP BY player_dismissed, then JOIN on player name."

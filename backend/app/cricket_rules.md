@@ -270,18 +270,62 @@ balls_faced = COUNT(*) FILTER (WHERE is_wide = false)
 
 #### Outs
 
+Outs must count only dismissals where the **specific player** was dismissed.
+The `player_dismissed` column identifies who got out — it may differ from `batsman`
+(e.g. run-out of non-striker). Always filter `player_dismissed = batsman` or
+compute outs in a separate CTE grouped by `player_dismissed`.
+
+**Correct (single-CTE):**
+
 ```sql
 outs = COUNT(*) FILTER (
-  WHERE player_dismissed IS NOT NULL
+  WHERE player_dismissed = batsman
     AND dismissal_kind <> 'retired hurt'
 )
 ```
 
-#### Batting Average
+**Correct (two-CTE — preferred for batting average):**
 
 ```sql
-batting_average = runs / outs
+-- CTE 1: runs grouped by batsman
+-- CTE 2: outs grouped by player_dismissed
+-- JOIN on player name
 ```
+
+> **NEVER DO THIS:** `COUNT(*) FILTER (WHERE player_dismissed IS NOT NULL)` inside
+> a `GROUP BY batsman` query — this counts ALL dismissals that happened while the
+> player was striker, including run-outs of the non-striker.
+
+#### Batting Average
+
+Batting average = total runs / number of times the player was dismissed.
+
+**Canonical SQL pattern (two-CTE):**
+
+```sql
+WITH batting_runs AS (
+    SELECT batsman AS player, SUM(batsman_runs) AS total_runs
+    FROM deliveries
+    GROUP BY batsman
+),
+batting_outs AS (
+    SELECT player_dismissed AS player, COUNT(*) AS outs
+    FROM deliveries
+    WHERE player_dismissed IS NOT NULL
+      AND dismissal_kind <> 'retired hurt'
+    GROUP BY player_dismissed
+)
+SELECT r.player, r.total_runs,
+    ROUND(r.total_runs::numeric / NULLIF(o.outs, 0), 2) AS batting_average
+FROM batting_runs r
+JOIN batting_outs o ON o.player = r.player
+WHERE o.outs > 0
+ORDER BY batting_average DESC;
+```
+
+> **Key insight:** The runs CTE groups by `batsman`, the outs CTE groups by
+> `player_dismissed`. These are different columns — joining them gives the
+> correct per-player average.
 
 #### Strike Rate
 
@@ -881,6 +925,9 @@ These rules are non-negotiable.
 - All-rounder ranking must not use only runs and wickets.
 - Eligibility thresholds must be applied before all-rounder ranking.
 - Normalization must be scoped to the selected ranking window.
+- Ducks, half-centuries, centuries, and batting average are innings-level outcomes — never compute them at ball level.
+- Per-innings stats must GROUP BY match_id, inning, batsman before counting.
+- Batting outs must be counted by `player_dismissed`, never by counting `player_dismissed IS NOT NULL` inside `GROUP BY batsman`.
 
 ---
 
@@ -895,6 +942,159 @@ These are strongly recommended defaults.
 - Use phase-adjusted batting and bowling context metrics.
 - Use dynamic eligibility thresholds for arbitrary windows.
 - Use a canonical player-mapping layer if name variation exists.
+
+---
+
+## 21. Innings-Level Aggregation Rules
+
+Many cricket statistics are **innings-level outcomes**, NOT ball-level events.
+The LLM must aggregate to the innings level (GROUP BY match_id, inning, batsman)
+before computing these metrics. Counting at ball level produces wildly wrong results.
+
+### 21.1 Aggregation Grain Principle
+
+A "batting innings" is a player's complete participation in one innings of a match.
+Metrics that describe the outcome of an innings must first compute per-innings totals,
+then filter or count at the innings level.
+
+**Correct grain for innings-level stats:**
+
+```sql
+-- Step 1: compute per-innings totals
+GROUP BY match_id, inning, batsman
+
+-- Step 2: filter/count at innings level
+WHERE innings_runs = 0 AND was_dismissed = true  -- for ducks
+```
+
+**NEVER DO THIS for innings-level stats:**
+
+```sql
+-- WRONG: counting at ball level
+SELECT batsman, COUNT(*) FROM deliveries
+WHERE batsman_runs = 0 AND dismissal_kind IS NOT NULL
+GROUP BY batsman
+```
+
+This counts individual balls where runs=0 AND a dismissal happened, which is
+completely different from counting innings where total runs=0.
+
+### 21.2 Duck
+
+A duck is when a batter scores zero runs in an innings AND is dismissed.
+
+**Definition:**
+- Innings runs = 0 (SUM of batsman_runs across all balls in that innings)
+- Batter was dismissed (player_dismissed = batsman for at least one ball)
+- Exclude `retired hurt` from dismissals
+
+**Canonical SQL pattern:**
+
+```sql
+WITH batting_innings AS (
+    SELECT match_id, inning, batsman AS player,
+        SUM(batsman_runs) AS runs
+    FROM deliveries
+    GROUP BY match_id, inning, batsman
+),
+dismissals AS (
+    SELECT match_id, inning, player_dismissed AS player
+    FROM deliveries
+    WHERE player_dismissed IS NOT NULL
+      AND dismissal_kind <> 'retired hurt'
+    GROUP BY match_id, inning, player_dismissed
+)
+SELECT bi.player, COUNT(*) AS ducks
+FROM batting_innings bi
+JOIN dismissals ds
+  ON ds.match_id = bi.match_id
+ AND ds.inning   = bi.inning
+ AND ds.player   = bi.player
+WHERE bi.runs = 0
+GROUP BY bi.player
+ORDER BY ducks DESC;
+```
+
+### 21.3 Golden Duck
+
+A golden duck is when a batter is dismissed on the first ball they face
+(innings runs = 0 AND balls faced = 1 AND dismissed).
+
+### 21.4 Half-Century
+
+A half-century is when a batter scores 50–99 runs in an innings.
+
+```sql
+WHERE innings_runs BETWEEN 50 AND 99
+```
+
+### 21.5 Century
+
+A century is when a batter scores 100+ runs in an innings.
+
+```sql
+WHERE innings_runs >= 100
+```
+
+### 21.6 Batting Average
+
+Batting average = total career runs / number of times dismissed.
+
+**Critical:** The denominator (outs) must be computed by grouping on `player_dismissed`,
+NOT by counting `player_dismissed IS NOT NULL` inside a `GROUP BY batsman` query.
+The `batsman` column is the striker; `player_dismissed` is who actually got out.
+On run-outs, the non-striker can be dismissed while a different player is striker.
+
+**Canonical SQL pattern:**
+
+```sql
+WITH batting_runs AS (
+    SELECT batsman AS player, SUM(batsman_runs) AS total_runs
+    FROM deliveries
+    GROUP BY batsman
+),
+batting_outs AS (
+    SELECT player_dismissed AS player, COUNT(*) AS outs
+    FROM deliveries
+    WHERE player_dismissed IS NOT NULL
+      AND dismissal_kind <> 'retired hurt'
+    GROUP BY player_dismissed
+)
+SELECT r.player, r.total_runs,
+    ROUND(r.total_runs::numeric / NULLIF(o.outs, 0), 2) AS batting_average
+FROM batting_runs r
+JOIN batting_outs o ON o.player = r.player
+WHERE o.outs > 0
+ORDER BY batting_average DESC;
+```
+
+**NEVER DO THIS:**
+
+```sql
+-- WRONG: counts ALL dismissals while player is striker, not this player's outs
+COUNT(*) FILTER (WHERE player_dismissed IS NOT NULL) ... GROUP BY batsman
+```
+
+### 21.7 Not Out Detection
+
+A batter is not out in an innings if they were never dismissed:
+
+```sql
+BOOL_AND(player_dismissed IS DISTINCT FROM batsman) AS not_out
+```
+
+Or equivalently:
+
+```sql
+MAX(CASE WHEN player_dismissed = batsman THEN 1 ELSE 0 END) = 0 AS not_out
+```
+
+### 21.8 Common Mistakes to Avoid
+
+- **Do NOT count balls where batsman_runs = 0 AND dismissal_kind IS NOT NULL** — this counts zero-run dismissal balls, not ducks
+- **Do NOT use deliveries-level COUNT for innings milestones** — always aggregate to innings first
+- **Do NOT group by batsman alone for per-innings stats** — must include match_id and inning
+- **Do NOT confuse player_dismissed with batsman** — on run-outs, the non-striker may be dismissed
 
 ---
 
