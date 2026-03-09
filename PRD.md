@@ -5,7 +5,7 @@
 | **Product Name** | NL2SQL IPL Cricket Agent                   |
 | **Version**      | 2.0 (planned)                              |
 | **Status**       | Draft                                      |
-| **Last Updated** | 2026-03-08                                 |
+| **Last Updated** | 2026-03-10                                 |
 
 ---
 
@@ -17,9 +17,10 @@ using plain English. The system generates PostgreSQL queries from natural
 language, executes them safely, and returns human-readable answers alongside the
 generated SQL for transparency.
 
-**Current state (v1):** A working end-to-end pipeline with input validation,
-few-shot SQL generation, conversation memory, error auto-correction, and
-multi-provider LLM fallback.
+**Current state (v1.1):** A working end-to-end pipeline with input validation,
+query rewrite + entity resolution, few-shot SQL generation, semantic SQL
+guardrails, insight generation, optional visualization, and multi-provider LLM
+fallback.
 
 **Target state (v2):** An intelligent data analyst agent that goes beyond
 question-answering to deliver insights, on-demand visualizations, and
@@ -150,13 +151,17 @@ Step 0: Query Rewrite                      ← agent.py
     │   - skipped on first turn (empty history)
     │   - safety guard: discard if not ending with "?" or 3x longer
     ▼
+Step 0b: Entity Resolution                 ← entity_resolver.py
+    │   - maps full player names to canonical dataset names
+    │   - example: "Sanju Samson" → "SV Samson"
+    ▼
 Step 1: Table Selection                    ← table_selector.py
     │   - LLM reads CSV descriptions, picks relevant tables
     │   - fallback to all tables if selector returns nothing
     ▼
 Step 2: SQL Generation                     ← prompts.py
     │   - NL → SQL using dynamic few-shot examples (ChromaDB similarity, k=3)
-    │   - conversation history injected via MessagesPlaceholder
+    │   - uses rewritten + resolved standalone question (no full history injection)
     ▼
 Step 3: SQL Cleaning                       ← sql_helpers.py
     │   - strips markdown fences, prefixes, prose
@@ -166,6 +171,11 @@ Layer 2: validate_sql()                    ← sql_helpers.py
     │   - no forbidden keywords (DROP, DELETE, UPDATE, INSERT, ALTER, etc.)
     │   - no system table access (pg_*, information_schema)
     │   → returns safe refusal message on violation
+    ▼
+Layer 2b: detect_semantic_sql_issue()      ← sql_helpers.py
+    │   - detects logical grain errors that still compile
+    │   - current rule blocks impossible `batsman_runs` filters (>6 per ball)
+    │   - triggers auto-correction before execution
     ▼
 Step 4: Execute + Auto-Correct             ← sql_helpers.py + agent.py
     │   - runs SQL; detects errors from QuerySQLDataBaseTool string output
@@ -567,13 +577,15 @@ class QueryResponse(BaseModel):
 | Phase 7 | LLM fallback chain (Claude, Gemini, DeepSeek, Ollama)     | ✅ Done   |
 | Phase 7.5 | Cricket domain knowledge RAG (cricket_rules.md + cricket_knowledge.py + 15 few-shot examples + ICC all-rounder formula) | ✅ Done |
 | Phase 7.6 | Load testing (Locust) + production hardening (timeout, 429 handling, Gemini model fix) | ✅ Done |
+| Phase 7.7 | Entity resolution (full-name → canonical-name) + semantic SQL guardrails | ✅ Done |
+| Phase 8 | Insight generation layer | ✅ Done |
+| Phase 9 | Visualization layer (LLM-generated Vega-Lite specs) | ✅ Done |
 
 ### Planned Phases
 
 | Phase    | Scope                                               | Dependencies     | Estimated Effort |
 |----------|-----------------------------------------------------|------------------|------------------|
-| Phase 8  | Insight generation layer                            | None             | Small            |
-| Phase 9  | Visualization layer (MCP chart server + Vega-Lite)  | Phase 8          | Medium           |
+| Phase 9.5 | Visualization migration to MCP chart server        | Phase 9          | Medium           |
 | Phase 10 | Multi-modal report agent                            | Phase 8 + 9      | Large            |
 | Phase 11 | Streaming responses (SSE)                           | None             | Medium           |
 | Phase 12 | Authentication + multi-user                         | None             | Medium           |
@@ -583,13 +595,16 @@ class QueryResponse(BaseModel):
 ```
 Phase 8 (Insights)
     │
-    ├───────────────▶ Phase 9 (Visualization + MCP)
+    ├───────────────▶ Phase 9 (Visualization - LLM specs)
+    │                     │
+    │                     ▼
+    │               Phase 9.5 (MCP migration)
     │                     │
     │                     ▼
     └───────────────▶ Phase 10 (Report Agent)
                           │
                           ▼
-                     uses MCP chart server from Phase 9
+                     uses MCP chart server from Phase 9.5
 
 Phase 11 (Streaming) ──── independent, can run in parallel
 Phase 12 (Auth)      ──── independent, can run in parallel

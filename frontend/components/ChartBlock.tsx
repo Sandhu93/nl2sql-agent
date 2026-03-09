@@ -39,8 +39,8 @@ export default function ChartBlock({ spec }: ChartBlockProps) {
       embed(containerRef.current, spec, {
         // Hide the Vega editor/export/source actions for a clean look
         actions: false,
-        // Respect the container width
-        width: "container",
+        // Keep options type-safe for this vega-embed version; width should be
+        // controlled from the Vega-Lite spec itself.
         // TODO: Enable export action once download UX is designed
         // actions: { export: true, source: false, compiled: false, editor: false },
       })

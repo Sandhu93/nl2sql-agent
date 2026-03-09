@@ -93,6 +93,18 @@ _SYSTEM_TABLE_ACCESS = re.compile(
     re.IGNORECASE,
 )
 
+# Semantic guardrails for cricket stats queries.
+# `batsman_runs` is per-ball runs (0..6), so filters like batsman_runs = 119 are
+# almost always a grain mismatch where the model intended innings total runs.
+_BATSMAN_RUNS_EQ_LITERAL = re.compile(
+    r"\bbatsman_runs\b\s*=\s*(\d+)\b",
+    re.IGNORECASE,
+)
+_BATSMAN_RUNS_GT_LITERAL = re.compile(
+    r"\bbatsman_runs\b\s*(>=|>|<=|<)\s*(\d+)\b",
+    re.IGNORECASE,
+)
+
 
 def validate_sql(sql: str) -> None:
     """
@@ -127,6 +139,38 @@ def validate_sql(sql: str) -> None:
     if _SYSTEM_TABLE_ACCESS.search(sql):
         _logger.warning("SQL blocked: system table access | sql=%r", sql[:120])
         raise ValueError("Only read-only SELECT queries are supported.")
+
+
+def detect_semantic_sql_issue(sql: str) -> str | None:
+    """
+    Detect high-confidence logical SQL issues that still execute syntactically.
+
+    Current checks:
+      - Impossible per-ball batsman_runs comparisons with values > 6
+
+    Returns:
+      Human-readable issue string, or None if no issue detected.
+    """
+    # batsman_runs = N where N > 6 is always impossible in IPL ball-level data.
+    for match in _BATSMAN_RUNS_EQ_LITERAL.finditer(sql):
+        if int(match.group(1)) > 6:
+            return (
+                "batsman_runs is per-ball (0-6). Do not filter innings totals "
+                "with batsman_runs = N where N > 6; aggregate by innings and use "
+                "HAVING SUM(batsman_runs) = N."
+            )
+
+    # Range comparisons above 6 on ball-level runs are also invalid patterns.
+    for match in _BATSMAN_RUNS_GT_LITERAL.finditer(sql):
+        op = match.group(1)
+        literal = int(match.group(2))
+        if (op in (">", ">=") and literal > 6) or (op in ("<", "<=") and literal > 6):
+            return (
+                "batsman_runs comparisons use per-ball runs (0-6). For innings "
+                "milestones, aggregate at (match_id, inning, batsman) first."
+            )
+
+    return None
 
 
 async def _run_sql(execute_query: QuerySQLDataBaseTool, sql: str) -> str:

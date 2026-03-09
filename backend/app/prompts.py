@@ -75,6 +75,17 @@ IPL_EXAMPLES = [
         ),
     },
     {
+        "input": "In which years did Sanju Samson play for Delhi Daredevils?",
+        "query": (
+            "SELECT DISTINCT m.year\n"
+            "FROM matches m\n"
+            "JOIN playing_xi px ON m.match_id = px.match_id\n"
+            "WHERE px.player_name = 'SV Samson'\n"
+            "  AND px.team = 'Delhi Daredevils'\n"
+            "ORDER BY m.year;"
+        ),
+    },
+    {
         "input": "Who has won the Player of the Match award the most times?",
         "query": (
             "SELECT player_of_match, COUNT(*) AS awards "
@@ -103,6 +114,31 @@ IPL_EXAMPLES = [
             "GROUP BY batsman, match_id "
             "ORDER BY runs_in_match DESC "
             "LIMIT 1;"
+        ),
+    },
+    {
+        "input": "What was Sanju Samson's strike rate in his 119-run innings against Punjab Kings?",
+        "query": (
+            "WITH target_innings AS (\n"
+            "    SELECT d.match_id, d.inning\n"
+            "    FROM deliveries d\n"
+            "    WHERE d.batsman = 'SV Samson'\n"
+            "      AND d.batting_team = 'Rajasthan Royals'\n"
+            "      AND d.bowling_team = 'Punjab Kings'\n"
+            "    GROUP BY d.match_id, d.inning\n"
+            "    HAVING SUM(d.batsman_runs) = 119\n"
+            "    ORDER BY d.match_id\n"
+            "    LIMIT 1\n"
+            ")\n"
+            "SELECT ROUND(\n"
+            "    100.0 * SUM(d.batsman_runs)::numeric\n"
+            "    / NULLIF(COUNT(*) FILTER (WHERE d.is_wide = false), 0),\n"
+            "    2\n"
+            ") AS strike_rate\n"
+            "FROM deliveries d\n"
+            "JOIN target_innings ti\n"
+            "  ON ti.match_id = d.match_id AND ti.inning = d.inning\n"
+            "WHERE d.batsman = 'SV Samson';"
         ),
     },
     {
@@ -462,6 +498,23 @@ def _build_few_shot_prompt() -> ChatPromptTemplate:
         "- Bowling stats (wickets, economy): GROUP BY bowler on deliveries.\n"
         "- Fielding stats (catches, run-outs): query the wicket_fielders table, "
         "NOT deliveries.\n"
+        "- For team filters in player participation queries (playing_xi), filter "
+        "directly on playing_xi.team. Do NOT join teams only to filter team name, "
+        "because historical aliases (e.g. Delhi Daredevils) may be present in "
+        "playing_xi even when teams uses a canonical name.\n"
+        "- Use team_aliases only when you must resolve alias -> canonical id "
+        "explicitly; otherwise prefer the team value stored in the fact table.\n"
+        "- Player names in ball-by-ball tables may be abbreviated/initialed "
+        "(e.g. 'RG Sharma'). If the user asks with a full name, resolve via "
+        "the players table (player_full_name -> player_name) and filter using "
+        "the canonical short player_name used in deliveries.\n"
+        "- `batsman_runs` is per-ball runs (0-6), not innings total. Never filter "
+        "innings milestones using `WHERE batsman_runs = 50/100/119/...`.\n"
+        "- For innings milestone follow-ups (e.g. 'when he scored 119', "
+        "'strike rate in that 119'): first identify target innings via "
+        "GROUP BY (match_id, inning, batsman) HAVING SUM(batsman_runs)=N, "
+        "then join back to deliveries for ball-level metrics (balls, strike rate, "
+        "boundaries, opponent, date).\n"
         "- INNINGS-LEVEL STATS (ducks, half-centuries, centuries, batting average): "
         "ALWAYS aggregate to per-innings level first (GROUP BY match_id, inning, batsman), "
         "then count/filter at the innings level. NEVER count these at ball level.\n"

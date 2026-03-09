@@ -1047,3 +1047,53 @@ Runs as the third parallel task in `asyncio.gather` alongside rephrase + insight
 - Error handling / retry loop — unchanged
 - Conversation history — unchanged
 - API response shape for non-viz queries (chart_spec is null) — no breaking change
+
+---
+
+## Phase 9.1 - Reliability Hardening (Post-Release Fixes)
+
+**Goal:** Fix follow-up reliability issues seen in live usage: player name mismatches, SQL drift in long chats, and logically invalid cricket-stat SQL that still compiles.
+
+### 1) Entity resolver for player names
+
+**New file:** `backend/app/entity_resolver.py`
+
+- Loads `players(player_full_name, player_name)` once (lazy cache)
+- Resolves full-name mentions to canonical dataset names
+- Example: `Sanju Samson` -> `SV Samson`
+- `run_agent()` now applies this after query rewrite and before table selection / SQL generation
+
+### 2) Reduce SQL-generation drift from long history
+
+- Kept rewrite history context, widened to the latest 8 messages for better follow-up resolution.
+- Stopped passing full chat history into SQL generation (`messages: []`).
+- SQL generation now relies on rewritten standalone question + resolved entity hints, reducing multi-turn hallucination.
+
+### 3) Team alias-safe prompting for participation queries
+
+`prompts.py` now explicitly teaches:
+- For `playing_xi` participation filters, use `playing_xi.team` directly
+- Avoid unnecessary `teams` join for historical alias names (for example, Delhi Daredevils)
+
+Added few-shot example:
+- "In which years did Sanju Samson play for Delhi Daredevils?"
+
+### 4) Semantic SQL guardrails (new validation layer)
+
+**New function:** `detect_semantic_sql_issue()` in `sql_helpers.py`
+
+Current high-confidence rule:
+- Flags impossible ball-level filters like `batsman_runs = 119` (per-ball runs are 0-6)
+
+Pipeline change in `agent.py`:
+- Run semantic check after `validate_sql()`
+- If issue detected, auto-repair through `_fix_sql()` with semantic error context
+- Retry up to `_MAX_SQL_RETRIES`, then return safe refusal if unresolved
+
+Added few-shot example:
+- Strike rate in a 119-run innings using innings-level `HAVING SUM(batsman_runs)=119` followed by join-back to deliveries.
+
+### 5) Frontend build fixes
+
+- Removed invalid package `@types/vega-embed` from `frontend/package.json`
+- Fixed `ChartBlock.tsx` by removing invalid `width: "container"` embed option (type mismatch during `next build`)

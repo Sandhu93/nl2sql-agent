@@ -50,9 +50,10 @@ from langchain_openai import ChatOpenAI
 
 from app.config import get_settings
 from app.cricket_knowledge import retrieve_cricket_rules
+from app.entity_resolver import resolve_player_mentions
 from app.insights_agent import generate_insights
 from app.prompts import _build_few_shot_prompt
-from app.sql_helpers import _clean_sql, _is_sql_error, _run_sql, validate_sql
+from app.sql_helpers import _clean_sql, _is_sql_error, _run_sql, validate_sql, detect_semantic_sql_issue
 from app.table_selector import get_table_details, get_table_names
 from app.viz_agent import generate_chart_spec, wants_visualization
 
@@ -212,6 +213,8 @@ async def _fix_sql(
                     "- CTE alias references: if a CTE is aliased as `b`, use `b.col` not `bp.col`\n"
                     "- Column names that don't exist in the schema\n"
                     "- Expressions in ORDER BY that reference SELECT-clause aliases\n\n"
+                    "- `batsman_runs` is per-ball (0-6), never innings totals; for "
+                    "filters like 50/100/119, aggregate by innings and use HAVING SUM(...)\n\n"
                     f"Relevant table schema:\n{schema}"
                 ),
             ),
@@ -394,11 +397,9 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
     # On the first turn (empty history) we skip the LLM call entirely — there
     # is nothing to resolve and we save one round-trip.
     if history.messages:
-        # Cap history sent to the rewrite chain at the last 2 turns (4 messages).
-        # The rewrite LLM only needs recent context (e.g. "What about 2020?") —
-        # passing the full accumulated history causes GPT-4o to read cricket stats
-        # from earlier AI answers and "answer" instead of "rewrite" the question.
-        rewrite_history = history.messages[-4:]
+        # Keep a wider rewrite window so follow-ups over longer threads still
+        # resolve correctly. We avoid full history to reduce drift.
+        rewrite_history = history.messages[-8:]
         standalone_question: str = await rewrite_query.ainvoke({
             "history": rewrite_history,
             "question": question,
@@ -423,6 +424,12 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
     else:
         standalone_question = question  # first turn — nothing to resolve
 
+    # Step 0b — Resolve entity aliases (e.g. full player names) into dataset
+    # names so SQL generation can match the underlying schema reliably.
+    resolved_question, player_name_mappings = resolve_player_mentions(standalone_question)
+    if player_name_mappings:
+        logger.info("Player name mappings applied: %s", player_name_mappings)
+
     # Steps 1 + 1b — Run table selection and cricket knowledge retrieval in
     # parallel. Both are independent of each other: table selection makes one
     # LLM API call; cricket retrieval makes one embedding API call + in-memory
@@ -434,8 +441,8 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
     #       question absorbs the one-time cost transparently.
     available_tables = set(_db.get_usable_table_names())
     raw_selection, cricket_context = await asyncio.gather(
-        select_table.ainvoke({"question": standalone_question}),
-        retrieve_cricket_rules(standalone_question, k=3),
+        select_table.ainvoke({"question": resolved_question}),
+        retrieve_cricket_rules(resolved_question, k=3),
     )
 
     # Step 1 — Validate table selection; fall back to all tables if needed.
@@ -450,12 +457,13 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
     # {cricket_context} carries the k=3 most relevant sections from
     # cricket_rules.md (e.g. bowling rules, eligibility rules, dismissal logic)
     # so the LLM generates cricket-correct SQL, not just schema-correct SQL.
-    # history.messages injects prior (HumanMessage, AIMessage) turns so the
-    # model can resolve follow-up references like "and what about in 2017?".
+    # We intentionally do NOT pass full chat history to SQL generation.
+    # Follow-up references are already resolved in Step 0 (rewrite), and
+    # long message history causes factual drift/hallucination in later turns.
     raw: str = await generate_query.ainvoke({
-        "question": standalone_question,
+        "question": resolved_question,
         "table_names_to_use": table_names,
-        "messages": history.messages,
+        "messages": [],
         "cricket_context": cricket_context,
     })
     logger.info("Raw LLM output: %s", raw)
@@ -479,6 +487,42 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
         logger.warning(
             "SQL validation blocked execution | thread_id=%s | reason=%s | sql=%r",
             thread_id, exc, sql,
+        )
+        history.add_user_message(question)
+        history.add_ai_message(answer)
+        return {"answer": answer, "sql": sql, "insights": None, "chart_spec": None}
+
+    # Layer 2b — semantic SQL validation for high-confidence logical errors
+    # that are syntactically valid but produce wrong/empty results.
+    semantic_issue = detect_semantic_sql_issue(sql)
+    semantic_attempts = 0
+    while semantic_issue and semantic_attempts < _MAX_SQL_RETRIES:
+        logger.warning(
+            "Semantic SQL issue detected (attempt %d/%d): %s | sql=%r",
+            semantic_attempts + 1,
+            _MAX_SQL_RETRIES,
+            semantic_issue,
+            sql[:200],
+        )
+        sql = await _fix_sql(
+            bad_sql=sql,
+            question=resolved_question,
+            error=f"Semantic validation error: {semantic_issue}",
+            table_names=table_names,
+        )
+        validate_sql(sql)
+        semantic_issue = detect_semantic_sql_issue(sql)
+        semantic_attempts += 1
+
+    if semantic_issue:
+        answer = (
+            "Your question could not be answered because the generated query "
+            "had a logical issue in how cricket stats were computed. "
+            "Please rephrase your question."
+        )
+        logger.warning(
+            "Semantic SQL validation blocked execution | thread_id=%s | reason=%s | sql=%r",
+            thread_id, semantic_issue, sql,
         )
         history.add_user_message(question)
         history.add_ai_message(answer)

@@ -676,7 +676,9 @@ rewrite='The top 5 run scorers in IPL history are:\n\n- V Kohli: 7263 runs\n- S 
 The full `history.messages` list was passed to the rewrite chain. After several turns, AI messages in the history contain entire cricket stat tables. GPT-4o reads those stats and generates an answer rather than reformulating the question — even though the system prompt says "only rewrite, never answer". With growing history (6+ turns, 12 messages), the accumulated data overwhelms the instruction.
 
 **Fix**
-Cap the history sent to the rewrite chain at the last 2 turns (4 messages). The rewrite chain only needs recent context to resolve references like "What about 2020?" — passing the full accumulated history is both unnecessary and harmful:
+Two changes:
+1. Cap the history sent to the rewrite chain at the last 4 turns (8 messages) so recent context is preserved without feeding the full transcript.
+2. Stop passing full conversation history into SQL generation (`messages: []`), relying on the rewritten standalone question instead.
 
 ```python
 # Before
@@ -685,8 +687,8 @@ standalone_question = await rewrite_query.ainvoke({
     "question": question,
 })
 
-# After — cap at last 2 turns (4 messages)
-rewrite_history = history.messages[-4:]
+# After — cap at last 4 turns (8 messages)
+rewrite_history = history.messages[-8:]
 standalone_question = await rewrite_query.ainvoke({
     "history": rewrite_history,
     "question": question,
@@ -710,11 +712,39 @@ WARNING | app.agent | Empty query result | sql=SELECT DISTINCT team FROM playing
 Player names in `deliveries` (batsman/bowler), `playing_xi`, and `wicket_fielders` are stored in abbreviated form (`'RG Sharma'`, `'V Kohli'`). The `players` table holds both `player_name` (abbreviated) and `player_full_name` (full). When the rewrite chain resolves a pronoun to a full name like "Rohit Sharma", the LLM uses that full name directly in the query without joining `players` — the mismatch silently returns zero rows with no SQL error.
 
 **Fix**
-Two-layer fix:
+Primary fix: added deterministic entity resolution before SQL generation.
 
-### Fix 1 — System prompt rule in prompts.py
-Added to KEY SCHEMA RULES:
-- "PLAYER NAMES: player names in deliveries, playing_xi, and wicket_fielders are abbreviated (e.g. 'RG Sharma'). When searching by full/common name, join with the players table: `JOIN players ON players.player_name = <col>` and filter by `players.player_full_name ILIKE '%name%'`."
+### Fix 1 — New `entity_resolver.py`
+- Loads player index from `players (player_full_name, player_name)` once.
+- Resolves full-name mentions to canonical short names used in fact tables.
+- Example mapping: `Sanju Samson` → `SV Samson`.
+- `run_agent()` now applies this right after query rewrite, before table selection and SQL generation.
 
-### Fix 2 — Few-shot example in prompts.py
-Added example #16 "Which IPL teams did Rohit Sharma play for?" demonstrating the `playing_xi JOIN players` pattern with `player_full_name ILIKE '%Rohit Sharma%'`.
+### Fix 2 — Prompt reinforcement in `prompts.py`
+- Added explicit rule that ball-by-ball and playing_xi queries should use canonical short player names.
+- Added examples to steer the model toward canonical-name usage.
+
+---
+
+## #25 — Semantic SQL bug: innings total filtered at ball level (`batsman_runs = 119`)
+
+**Symptom**
+Follow-up questions like "What was his strike rate in that 119?" sometimes produced SQL using `WHERE batsman_runs = 119`, which is impossible at ball level and returns empty/wrong results.
+
+**Root cause**
+`batsman_runs` is a per-ball field (0–6). The model mixed grains by applying an innings-level milestone (119) directly to a ball-level column.
+
+**Fix**
+Two-layer safeguard:
+
+### Fix 1 — Semantic SQL validator in `sql_helpers.py`
+Added `detect_semantic_sql_issue(sql)` to flag high-confidence logical errors, currently including impossible `batsman_runs` comparisons (>6).
+
+### Fix 2 — Auto-repair loop in `agent.py`
+After `validate_sql()`, semantic issues trigger `_fix_sql()` with explicit feedback:
+- "batsman_runs is per-ball (0-6); use GROUP BY ... HAVING SUM(batsman_runs)=N for innings milestones."
+Retries up to `_MAX_SQL_RETRIES`, then safely refuses execution if still invalid.
+
+### Prompt/Few-shot reinforcement
+- Added rules in `prompts.py` forbidding innings milestones in `WHERE batsman_runs = N`.
+- Added a few-shot example for strike-rate-in-119 pattern using innings identification via `HAVING SUM(...)` then join-back.
