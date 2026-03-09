@@ -170,6 +170,8 @@ _rewrite_query = None  # chain: {"history": list, "question": str} → standalon
 # Per-thread conversation history (in-memory, lost on restart).
 # Keyed by thread_id so each browser session has its own message history.
 _conversation_histories: dict[str, ChatMessageHistory] = {}
+# Per-thread recent insight chips for cross-turn dedupe.
+_recent_follow_up_chips: dict[str, list[str]] = {}
 
 # Maximum number of LLM-driven correction attempts after a SQL execution error.
 _MAX_SQL_RETRIES = 2
@@ -588,6 +590,7 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
     # TODO: If insights or viz add too much latency, gate them behind
     #       ENABLE_INSIGHTS / ENABLE_VIZ config flags in config.py.
     viz_requested = wants_visualization(standalone_question)
+    recent_chips = _recent_follow_up_chips.get(thread_id, [])
 
     async def _maybe_chart() -> dict | None:
         """Run chart spec generation only when the question asks for a viz."""
@@ -601,7 +604,7 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
             "query": sql,
             "result": result,
         }),
-        generate_insights(standalone_question, result, _llm),
+        generate_insights(standalone_question, result, _llm, recent_chips=recent_chips),
         _maybe_chart(),
     )
     logger.info("Rephrased answer: %s", answer)
@@ -612,6 +615,14 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
     )
     if chart_spec:
         logger.info("Chart spec generated | viz_requested=%s", viz_requested)
+
+    # Update recent chips memory (last 2 turns ~= 6 chips max) for dedupe.
+    chips = insights.get("follow_up_chips", []) if isinstance(insights, dict) else []
+    merged_recent: list[str] = []
+    for chip in [*recent_chips, *chips]:
+        if chip and chip not in merged_recent:
+            merged_recent.append(chip)
+    _recent_follow_up_chips[thread_id] = merged_recent[-6:]
 
     # Update conversation history so the next turn in this session can
     # reference what was asked and answered here.
