@@ -28,7 +28,7 @@ services:
     env_file:
       - .env
     environment:
-      - ALLOWED_ORIGINS=["http://localhost:8085"]
+      - ALLOWED_ORIGINS=["http://localhost:8085","https://backend.sandeepbkadam.com"]
       - DB_PORT=5432
     volumes:
       # Hot-reload: mount source code so uvicorn --reload picks up changes.
@@ -52,7 +52,9 @@ services:
       dockerfile: Dockerfile
       args:
         # Baked into the client-side JS bundle at build time.
-        NEXT_PUBLIC_BACKEND_URL: http://localhost:8086
+        # To use the public backend domain, override here or set in .env:
+        #   NEXT_PUBLIC_BACKEND_URL: https://backend.sandeepbkadam.com
+        NEXT_PUBLIC_BACKEND_URL: https://backend.sandeepbkadam.com
     container_name: nl2sql_frontend
     ports:
       - "8085:8085"
@@ -61,7 +63,7 @@ services:
     environment:
       # Runtime fallback (server-side rendering only). Client-side bundle uses
       # the value baked in at build time via the build arg above.
-      - NEXT_PUBLIC_BACKEND_URL=http://localhost:8086
+      - NEXT_PUBLIC_BACKEND_URL=https://backend.sandeepbkadam.com
     networks:
       - app_net
     depends_on:

@@ -589,7 +589,10 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
     #
     # TODO: If insights or viz add too much latency, gate them behind
     #       ENABLE_INSIGHTS / ENABLE_VIZ config flags in config.py.
-    viz_requested = wants_visualization(standalone_question)
+    # Check both the original question and the rewritten standalone question because
+    # the query rewriter may strip chart-related keywords (e.g. "show me a bar chart"
+    # → "Who were the top 10 run scorers?"), causing viz intent to be silently lost.
+    viz_requested = wants_visualization(question) or wants_visualization(standalone_question)
     recent_chips = _recent_follow_up_chips.get(thread_id, [])
 
     async def _maybe_chart() -> dict | None:
