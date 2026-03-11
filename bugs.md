@@ -748,3 +748,119 @@ Retries up to `_MAX_SQL_RETRIES`, then safely refuses execution if still invalid
 ### Prompt/Few-shot reinforcement
 - Added rules in `prompts.py` forbidding innings milestones in `WHERE batsman_runs = N`.
 - Added a few-shot example for strike-rate-in-119 pattern using innings identification via `HAVING SUM(...)` then join-back.
+
+---
+
+## #26 — NL2SQL always returns LIMIT 5 regardless of question intent
+
+**Symptom**
+All single-answer questions (e.g. "Who scored the most runs in IPL 2025?") returned 5 rows instead of 1.
+Evaluation showed 17 of 50 test cases failing with "column count mismatch" or extra rows — all traceable to LIMIT 5 appended unconditionally.
+
+**Root cause**
+`create_sql_query_chain` has a `top_k` parameter defaulting to 5. When the few-shot prompt template contains `{top_k}`, the model sees `LIMIT 5` in the instruction and blindly applies it to every query, including ones where only a single result is appropriate ("who has the most…", "what is the highest…").
+
+**Fix**
+Added an explicit `LIMIT` rule to the system prompt in `prompts.py`:
+
+```
+LIMIT rules: Use LIMIT 1 when the question asks for a single result
+('who has the most', 'which team/player', 'what is the highest/best/lowest').
+Only use LIMIT {top_k} when the user explicitly requests multiple results
+('top 5', 'top 10', 'list', 'give me N', 'give the top N').
+```
+
+Also added a system prompt rule to suppress extra debug columns:
+```
+Return only the columns needed to answer the question. Do not add
+intermediate, debug, or context columns (e.g. do not include player name
+alongside a single computed stat when only the stat was asked for).
+```
+
+**Impact**: Resolved ~17 of 50 eval failures in a single pass.
+
+---
+
+## #27 — Semantic SQL direction errors: "runs against" and "wickets against" use wrong team column
+
+**Symptom** (three distinct but related errors)
+
+1. **"Runs against team"**: "Which player has scored the most runs against Chennai Super Kings?" → SQL used `batting_team = 'Chennai Super Kings'`, returning runs scored BY CSK batsmen, not AGAINST them. Correct column: `bowling_team`.
+
+2. **"Wickets against team"**: "Which bowler has the most wickets against Mumbai Indians?" → SQL used `bowling_team = 'Mumbai Indians'`, counting MI's own bowlers' wickets. Correct: `batting_team = 'Mumbai Indians'` (MI is batting; count dismissals of their batsmen).
+
+3. **Dot ball definition**: "Who bowled the most dot balls?" → SQL used `extras = 0` to identify dot balls, which incorrectly excludes deliveries with byes/leg-byes (still dot balls for the bowler). Correct: `batsman_runs = 0 AND NOT is_wide AND NOT is_no_ball`.
+
+**Root cause**
+The model has no teaching signal for these domain-specific directional semantics. Without few-shot examples, it makes the natural but wrong assumption:
+- "against CSK" → CSK is in the query somehow → uses `batting_team` (CSK batting) or `bowling_team` (CSK bowling) at random
+- "dot ball" → no runs scored → checks `extras = 0` (a reasonable-sounding but wrong proxy)
+
+**Fix**
+Three-layer fix:
+
+### System prompt rules in `prompts.py`
+```
+- RUNS SCORED AGAINST A TEAM: to find how many runs a batsman has scored against an
+  opposing team, filter bowling_team = '[opponent]' (the team that is BOWLING).
+  NEVER use batting_team for this — batting_team is the batsman's OWN team.
+- 'Wickets against [team]' means dismissals OF that team's batsmen:
+  filter batting_team = '[team]'. NEVER use bowling_team = '[team]' for this.
+- DOT BALL definition: a legal delivery where the batsman scores 0 runs:
+  batsman_runs = 0 AND NOT is_wide AND NOT is_no_ball.
+  Do NOT use extras = 0 — a delivery with byes/leg-byes is still a dot ball to the bowler.
+```
+
+### New few-shot examples in `IPL_EXAMPLES`
+- "Against which team has Rohit Sharma scored the most IPL runs?" → `WHERE batsman = 'RG Sharma' GROUP BY bowling_team`
+- "Which bowler has taken the most wickets against Chennai Super Kings?" → `WHERE batting_team = 'Chennai Super Kings' AND dismissal_kind IN (...)`
+- "How many wickets did Rajasthan Royals lose in IPL 2023?" → `WHERE batting_team = 'Rajasthan Royals' AND dismissal_kind IS NOT NULL`
+
+---
+
+## #28 — `winner_runs` and `winner_wickets` misinterpreted as innings scores
+
+**Symptom**
+"Which team chased the highest total?" and "Which team defended the lowest total?" returned wrong teams and scores. The model was reading `winner_runs` as the winning team's innings score (e.g. 200) instead of the winning margin in runs.
+
+**Root cause**
+`winner_runs` in the `matches` table stores the **winning margin** in runs (e.g. won by 47 runs), NOT the batting team's innings total. Similarly, `winner_wickets` stores wickets REMAINING for the winner (e.g. won by 3 wickets), NOT wickets lost. Queries that used `MAX(winner_runs)` to find "highest chase" got the biggest winning margin, not the highest total chased.
+
+**Fix**
+
+### System prompt rules in `prompts.py`
+```
+- winner_runs in matches is the WINNING MARGIN in runs (not the score).
+  winner_wickets is wickets REMAINING for the winner (not wickets lost).
+  To find innings scores: SUM(batsman_runs + extras) FROM deliveries GROUP BY match_id, inning, batting_team.
+- Highest successfully chased total: aggregate inning=2 from deliveries JOIN matches
+  WHERE winner_wickets IS NOT NULL AND batting_team = winner, ORDER DESC LIMIT 1.
+- Lowest successfully defended total: aggregate inning=1 from deliveries JOIN matches
+  WHERE winner_runs IS NOT NULL AND batting_team = winner, ORDER ASC LIMIT 1.
+```
+
+### New few-shot example in `IPL_EXAMPLES`
+- "Which team defended the lowest total in IPL history?" — full CTE using `first_innings` aggregation from deliveries, joined to matches with `winner_runs IS NOT NULL AND batting_team = winner`.
+
+### Expected SQL updated in `eval_testcases.json`
+Both Q34 (highest chase) and Q35 (lowest defended) expected SQL rewrote from `winner_runs`-based logic to `SUM(batsman_runs + extras)` from deliveries.
+
+---
+
+## #29 — Death overs range wrong in system prompt (BETWEEN 15 AND 19 instead of 16 AND 19)
+
+**Symptom**
+"Which bowler took the most wickets in death overs in IPL 2025?" returned M Prasidh Krishna (15 wickets, using overs 16–20) instead of Arshdeep Singh (11 wickets, using overs 17–20 = 0-indexed overs 16–19). A regression introduced while adding the over-indexing rule to the system prompt.
+
+**Root cause**
+The system prompt rule was written as `over BETWEEN 15 AND 19` for death overs, which includes `over=15` (the 16th over, a middle over, not a death over). The correct 0-indexed death overs are `BETWEEN 16 AND 19` (overs 17–20). The model faithfully followed the prompt rule, producing an incorrect over range.
+
+**Fix**
+Corrected the system prompt rule and added an explicit `NEVER` guard:
+```
+Death overs = over BETWEEN 16 AND 19 (overs 17-20, the last 4 overs).
+NEVER use BETWEEN 1 AND 6 for powerplay — that skips over=0 and includes over=6.
+NEVER use BETWEEN 15 AND 19 for death overs — that adds over=15 (the 16th over).
+```
+
+**Lesson**: System prompt rules teaching over ranges must include explicit negative examples, not just the correct range. The model can follow a wrong rule as faithfully as a right one.

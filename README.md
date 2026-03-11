@@ -14,10 +14,14 @@ nl2sql_agent/
 │   │   ├── config.py            ← pydantic-settings (reads from .env)
 │   │   ├── agent.py             ← ⭐ orchestrator: run_agent() entry point
 │   │   ├── sql_helpers.py       ← SQL parsing, execution & output validation
-│   │   ├── prompts.py           ← IPL few-shot examples + prompt template
+│   │   ├── prompts.py           ← IPL few-shot examples + prompt template (21 examples)
 │   │   ├── table_selector.py    ← CSV-backed table description helpers
 │   │   ├── input_validator.py   ← input sanitization & prompt injection defence
-│   │   ├── entity_resolver.py  ← player full-name → canonical dataset-name mapping
+│   │   ├── entity_resolver.py   ← player full-name → canonical dataset-name mapping
+│   │   ├── cricket_knowledge.py ← RAG: loads cricket_rules.md into ChromaDB
+│   │   ├── cricket_rules.md     ← canonical cricket stats spec (~1300 lines, 26 §§)
+│   │   ├── insights_agent.py    ← insight generation (key takeaway + follow-up chips)
+│   │   ├── viz_agent.py         ← visualization intent detection + Vega-Lite spec gen
 │   │   ├── database_table_descriptions.csv
 │   │   └── routes/
 │   │       └── query.py         ← POST /api/query endpoint
@@ -29,11 +33,17 @@ nl2sql_agent/
 │   │   └── page.tsx             ← chat UI
 │   ├── components/
 │   │   ├── ChatMessage.tsx
-│   │   └── SqlBlock.tsx
+│   │   ├── SqlBlock.tsx
+│   │   ├── InsightsCard.tsx     ← key takeaway + clickable follow-up chips
+│   │   └── ChartBlock.tsx       ← Vega-Lite chart renderer (vega-embed)
 │   ├── lib/
 │   │   └── api.ts               ← fetch wrapper for /api/query
 │   ├── Dockerfile
 │   └── .env.local.example
+├── scripts/
+│   ├── eval_testcases.json      ← 50 ground-truth NL→SQL test cases
+│   ├── eval.py                  ← evaluation script (hits live API, compares results)
+│   └── eval_report.md           ← auto-generated accuracy report (latest: 82%)
 ├── docker-compose.yml
 ├── .env.example
 └── README.md                    ← you are here
@@ -59,11 +69,11 @@ Each question passes through a validation + pipeline sequence:
 |------|--------|--------------|
 | 0. Query rewrite | `agent.py` | Rewrites ambiguous follow-ups into standalone questions using conversation history (skipped on the first turn) |
 | 0b. Entity resolution | `entity_resolver.py` | Resolves full player names to canonical short names used in tables (e.g. `Sanju Samson` → `SV Samson`) |
-| 1. Table selection | `table_selector.py` | LLM reads plain-English table descriptions and picks only the relevant tables |
-| 2. SQL generation | `prompts.py` | LLM writes PostgreSQL from the standalone resolved question using dynamic few-shot examples |
+| 1. Table selection + Cricket RAG | `table_selector.py` + `cricket_knowledge.py` | Run in parallel: LLM picks relevant tables; ChromaDB retrieves the 3 most relevant cricket rules sections for context injection |
+| 2. SQL generation | `prompts.py` | LLM writes PostgreSQL using dynamic few-shot examples (21 examples, ChromaDB k=3) + injected cricket domain rules |
 | 3. SQL cleaning | `sql_helpers.py` | Strips markdown fences, prefixes, and prose from LLM output |
 | 4. Execution + retry | `sql_helpers.py` | Runs the SQL; on error, asks the LLM to correct it (up to 2 retries) |
-| 5. Rephrasing | `agent.py` | Converts the raw DB result into a readable natural-language sentence |
+| 5. Rephrase + Insights + Viz | `agent.py` + `insights_agent.py` + `viz_agent.py` | Run in parallel: converts result to natural language; generates key takeaway + follow-up chips; optionally generates a Vega-Lite chart spec if the question requests a visualization |
 
 Conversation history is stored per `thread_id` so follow-up questions like
 *"and what about in 2017?"* resolve correctly within the same chat session.
@@ -196,6 +206,23 @@ Returns `{"status": "ok"}` when the backend is running.
 
 The `thread_id` is generated once per browser session (via `crypto.randomUUID()`)
 and sent with every message so the backend can maintain per-session conversation history.
+
+---
+
+## Correctness evaluation
+
+A 50-question ground-truth test suite lives in `scripts/eval_testcases.json`. Each entry has a natural-language question, a reference SQL query, and category metadata.
+
+Run the evaluation against the live API:
+
+```bash
+cd scripts
+python eval.py
+```
+
+Results are written to `scripts/eval_report.md`. Latest run: **82% accuracy** (41/50 PASS), avg latency 8.09 s.
+
+To improve accuracy, edit `prompts.py` (add or refine few-shot examples, adjust system prompt rules), restart the Docker backend to rebuild the ChromaDB vector store, then re-run the script.
 
 ---
 

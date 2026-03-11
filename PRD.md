@@ -5,7 +5,7 @@
 | **Product Name** | NL2SQL IPL Cricket Agent                   |
 | **Version**      | 2.0 (planned)                              |
 | **Status**       | Draft                                      |
-| **Last Updated** | 2026-03-10                                 |
+| **Last Updated** | 2026-03-12                                 |
 
 ---
 
@@ -580,6 +580,7 @@ class QueryResponse(BaseModel):
 | Phase 7.7 | Entity resolution (full-name → canonical-name) + semantic SQL guardrails | ✅ Done |
 | Phase 8 | Insight generation layer | ✅ Done |
 | Phase 9 | Visualization layer (LLM-generated Vega-Lite specs) | ✅ Done |
+| Phase 9.2 | Correctness evaluation framework (50-question test suite, eval.py, eval_report.md) | ✅ Done |
 
 ### Planned Phases
 
@@ -717,8 +718,8 @@ Phase 12 (Auth)      ──── independent, can run in parallel
 
 | Metric                              | Current (v1)  | Target (v2)         |
 |--------------------------------------|---------------|---------------------|
-| Query accuracy (correct SQL)         | ~90% (with cricket RAG + 15 examples) | ~95% (Phase 8+)|
-| Avg response time — single query     | ~3s           | < 5s (with insights)|
+| Query accuracy (correct SQL)         | 82% (50-question formal eval, Mar 2026) | ~90%+ |
+| Avg response time — single query     | ~8s (avg across 50 eval queries)  | < 5s (with insights)|
 | User engagement — follow-up rate     | N/A           | 30%+ click follow-up chips |
 | Viz requests served successfully     | N/A           | > 90%               |
 | Reports generated successfully       | N/A           | > 80%               |

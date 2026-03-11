@@ -1097,3 +1097,84 @@ Added few-shot example:
 
 - Removed invalid package `@types/vega-embed` from `frontend/package.json`
 - Fixed `ChartBlock.tsx` by removing invalid `width: "container"` embed option (type mismatch during `next build`)
+
+---
+
+## Phase 9.2 — Correctness Evaluation Framework
+
+**Goal:** Measure and systematically improve SQL generation accuracy with a reproducible, automated test suite.
+
+### What was built
+
+| Artifact | Purpose |
+|---|---|
+| `scripts/eval_testcases.json` | 50 ground-truth test cases — each with `{id, category, question, expected_sql, notes}` |
+| `scripts/eval.py` | Evaluation script: executes expected SQL and model SQL against the live DB, compares tabular results, emits a Markdown report |
+| `scripts/eval_report.md` | Auto-generated output: per-question verdict, category breakdown, failure details with both SQLs side-by-side |
+
+### Test case categories
+
+| Category | Tests | Description |
+|---|---|---|
+| batting_stats | 10 | Individual batting metrics (runs, strike rate, average, boundaries) |
+| bowling_stats | 8 | Bowling metrics (wickets, economy, strike rate, dot balls) |
+| match_info | 5 | Match metadata (date, venue, toss, teams) |
+| team_stats | 5 | Team-level aggregations (wins, matches played) |
+| phase_analysis | 4 | Over-phase breakdowns (powerplay, death overs) |
+| match_scorecard | 3 | Innings totals and wickets |
+| batting_records | 2 | Career milestones (not-outs, ducks) |
+| bowling_records | 1 | Bowling career stats |
+| finals_stats | 2 | IPL final–specific stats |
+| head_to_head | 2 | Player vs player/team matchups |
+| milestone_innings | 2 | Centuries and half-centuries |
+| records | 2 | All-time records (highest chase, lowest defended) |
+| team_records | 1 | Win percentage |
+| awards | 1 | Player of the Match |
+
+### Accuracy progression
+
+| Run | Accuracy | Key fixes applied |
+|---|---|---|
+| Baseline | ~40% | Raw; top_k LIMIT 5 affecting all single-answer queries |
+| Round 1 | 80% | LIMIT 1 rule, column count rules, boolean column fixes in expected SQL, semantic direction rules (bowling_team/batting_team), dot ball definition, winner_runs/winner_wickets semantics, few-shot examples for runs-against and wickets-against patterns |
+| Round 2 | 82% | Death overs range corrected (BETWEEN 16 AND 19), economy rate expected SQL corrected (1-col formula, byes/leg-byes excluded) |
+
+### Root causes discovered and fixed
+
+**RC#1 — LIMIT 5 default (17 failures)**
+LangChain `top_k=5` caused model to add `LIMIT 5` to all queries. Fixed by adding explicit LIMIT rules to the system prompt: use LIMIT 1 for single-result questions, LIMIT N only when explicitly requested.
+
+**RC#2 — Semantic direction errors (4 failures)**
+- "Runs against team" → model used `batting_team` (player's own team) instead of `bowling_team` (the opponent bowling at them)
+- "Wickets against team" → model used `bowling_team` instead of `batting_team`
+- Dot ball → model used `extras = 0` instead of `batsman_runs = 0 AND NOT is_wide AND NOT is_no_ball`
+
+Fixed via system prompt rules and three new few-shot examples (Rohit vs CSK, wickets against CSK, wickets lost by RR).
+
+**RC#3 — Extra debug columns (4 failures)**
+Model added informational columns (e.g. player name alongside a single computed stat) that weren't in the expected output. Fixed by adding "Return only the columns needed" rule to the system prompt.
+
+**RC#4 — winner_runs / winner_wickets misinterpretation (2 failures)**
+`winner_runs` is a winning margin (e.g. 47 runs), not an innings score. `winner_wickets` is wickets remaining, not wickets lost. Fixed via system prompt rules + new few-shot example (lowest defended total) + corrected expected SQL in eval_testcases.json.
+
+**RC#5 — Q14 matches played interpretation**
+"Matches played" should count squad appearances from `playing_xi`, not batting appearances from `deliveries`. Updated expected SQL to `SELECT COUNT(DISTINCT match_id) FROM playing_xi WHERE player_name = 'V Kohli'`.
+
+**RC#6 — Death overs range bug (regression in system prompt)**
+System prompt was written with `BETWEEN 15 AND 19` (includes the 16th over) instead of `BETWEEN 16 AND 19`. Model faithfully followed the wrong rule. Added `NEVER use BETWEEN 15 AND 19 for death overs` guard to prevent regression.
+
+**RC#7 — Economy rate expected SQL wrong (1 failure)**
+Expected SQL had 2 columns (bowler + economy_rate) but the question asks for a single stat. Also the economy formula in expected SQL included all extras; correct formula excludes byes/leg-byes. Corrected expected SQL to 1 column with the right formula.
+
+### Remaining failures (8 known, low priority)
+
+| ID | Issue | Status |
+|---|---|---|
+| 5 | Toss decision — expected SQL returns toss_winner too | Expected SQL too strict; model answer is correct |
+| 13 | Highest score — model returns match_id alongside score | Expected SQL too strict; both cols are contextually useful |
+| 15 | Batting average — model returns total_runs alongside average | Expected SQL too strict |
+| 19 | Fastest fifty — model counts all innings balls (incl. wides) not milestone balls | Needs window-function few-shot example |
+| 26 | Best bowling strike rate — model omits wickets column | Expected SQL expectation stricter than necessary |
+| 32 | Match scorecard — expected 4 cols (batting_team, inning, runs, wickets), model returns 3 | Model omits wickets_lost column |
+| 42 | Win percentage — model returns 4 cols vs expected 2 | Batting average few-shot teaches debug-column pattern; risky to fix |
+| 46 | Death overs wickets — fixed in Round 2 | ✅ Resolved |
