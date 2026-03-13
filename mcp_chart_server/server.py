@@ -28,7 +28,8 @@ from mcp.server.fastmcp import FastMCP
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-mcp = FastMCP("chart-server")
+port = int(os.getenv("PORT", "8087"))
+mcp = FastMCP("chart-server", host="0.0.0.0", port=port)
 
 
 @mcp.tool()
@@ -143,8 +144,7 @@ def generate_chart(
 
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8087"))
     logger.info("Starting MCP chart server | transport=SSE | port=%d", port)
     # TODO: When MCP SDK supports adding custom routes to the SSE app,
     #       add a /health endpoint here for a proper HTTP health check.
-    mcp.run(transport="sse", host="0.0.0.0", port=port)
+    mcp.run(transport="sse")
