@@ -32,6 +32,15 @@ class Settings(BaseSettings):
     db_port: int = Field(default=5432, description="Database port")
     db_name: str = Field(..., description="Database name")
 
+    # MCP Chart Server (Phase 9.5)
+    # Internal Docker URL when running via docker-compose.
+    # Override in .env for local dev: MCP_CHART_SERVER_URL=http://localhost:8087
+    # TODO: Set to None to disable chart generation entirely (e.g. resource-constrained envs).
+    mcp_chart_server_url: str = Field(
+        default="http://mcp_chart_server:8087",
+        description="Base URL of the MCP chart server (SSE endpoint = /sse)",
+    )
+
     # CORS
     allowed_origins: list[str] = Field(
         default=["http://localhost:8085"],

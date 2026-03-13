@@ -2,8 +2,9 @@
 # NL2SQL Agent — Docker Compose (development)
 #
 # Services:
-#   backend  — FastAPI on port 8086
-#   frontend — Next.js on port 8085
+#   mcp_chart_server — MCP chart server (SSE) on port 8087   ← Phase 9.5
+#   backend          — FastAPI on port 8086
+#   frontend         — Next.js on port 8085
 #
 # Usage:
 #   cp .env.example .env   # fill in your secrets
@@ -15,6 +16,34 @@ networks:
     driver: bridge
 
 services:
+  # --------------------------------------------------------------------------
+  # MCP Chart Server — Phase 9.5
+  # Deterministic Vega-Lite spec generation exposed as an MCP tool over SSE.
+  # The backend calls this instead of asking the LLM to generate the spec,
+  # eliminating hallucinated field names and malformed JSON.
+  # --------------------------------------------------------------------------
+  mcp_chart_server:
+    build:
+      context: ./mcp_chart_server
+      dockerfile: Dockerfile
+    container_name: nl2sql_mcp_chart
+    ports:
+      - "8087:8087"
+    environment:
+      - PORT=8087
+    networks:
+      - app_net
+    restart: unless-stopped
+    # Health check: verify the SSE port is accepting TCP connections.
+    # TODO: Replace with an HTTP /health endpoint once FastMCP supports
+    #       custom route injection into the SSE Starlette app.
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(); s.settimeout(2); s.connect(('localhost', 8087)); s.close()\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
   # --------------------------------------------------------------------------
   # FastAPI backend
   # --------------------------------------------------------------------------
@@ -28,13 +57,19 @@ services:
     env_file:
       - .env
     environment:
-      - ALLOWED_ORIGINS=["http://localhost:8085","https://backend.sandeepbkadam.com"]
+      - ALLOWED_ORIGINS=["http://localhost:8085"]
       - DB_PORT=5432
+      # MCP chart server URL — internal Docker DNS name
+      # TODO: Update to external URL if mcp_chart_server is deployed separately.
+      - MCP_CHART_SERVER_URL=http://mcp_chart_server:8087
     volumes:
       # Hot-reload: mount source code so uvicorn --reload picks up changes.
       - ./backend/app:/app/app
     networks:
       - app_net
+    depends_on:
+      mcp_chart_server:
+        condition: service_healthy
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8086/health"]
@@ -53,8 +88,8 @@ services:
       args:
         # Baked into the client-side JS bundle at build time.
         # To use the public backend domain, override here or set in .env:
-        #   NEXT_PUBLIC_BACKEND_URL: https://backend.sandeepbkadam.com
-        NEXT_PUBLIC_BACKEND_URL: https://backend.sandeepbkadam.com
+        #   NEXT_PUBLIC_BACKEND_URL: http://localhost:8086
+        NEXT_PUBLIC_BACKEND_URL: http://localhost:8086
     container_name: nl2sql_frontend
     ports:
       - "8085:8085"
@@ -63,7 +98,7 @@ services:
     environment:
       # Runtime fallback (server-side rendering only). Client-side bundle uses
       # the value baked in at build time via the build arg above.
-      - NEXT_PUBLIC_BACKEND_URL=https://backend.sandeepbkadam.com
+      - NEXT_PUBLIC_BACKEND_URL=http://localhost:8086
     networks:
       - app_net
     depends_on:
