@@ -864,3 +864,170 @@ NEVER use BETWEEN 15 AND 19 for death overs — that adds over=15 (the 16th over
 ```
 
 **Lesson**: System prompt rules teaching over ranges must include explicit negative examples, not just the correct range. The model can follow a wrong rule as faithfully as a right one.
+
+---
+
+## #30 — Chart silently skipped: `Decimal` values in SQL result break `ast.literal_eval`
+
+**Symptom**
+Any query whose result contains a computed decimal (e.g. batting average, economy rate, ROUND()) produces no chart even when the user explicitly asks for one. Docker log:
+```
+INFO  | app.viz_agent | Chart intent | chart_type=line | x=season | y=batting_average
+WARNING | app.viz_agent | Chart skipped — no parseable rows in SQL result
+```
+Example trigger: *"Can you plot Virat Kohli's batting average per IPL season?"*
+
+SQL result string:
+```
+[('2007/08', 165, 11, Decimal('15.00')), ('2009', 246, 11, Decimal('22.36')), ...]
+```
+
+**Root cause**
+`_parse_result_to_rows()` in `viz_agent.py` called `ast.literal_eval(result)` directly on the raw string returned by `QuerySQLDataBaseTool`. psycopg2 serialises `NUMERIC`/`DECIMAL` PostgreSQL columns as Python `Decimal('15.00')` constructor calls inside the repr string. `ast.literal_eval` only handles Python literals (`str`, `int`, `float`, `list`, `tuple`, etc.) — constructor calls like `Decimal('15.00')` are not literals and raise a `ValueError`. The `except Exception: return []` guard silently swallowed the error, returning an empty list, which caused the chart to be skipped with no visible error to the user.
+
+**Fix**
+Strip `Decimal('...')` with a regex substitution before parsing:
+
+```python
+# Before — fails silently on Decimal values
+rows = ast.literal_eval(result)
+
+# After — sanitise Decimal constructor calls first
+sanitized = re.sub(r"Decimal\('([^']+)'\)", r"\1", result)
+rows = ast.literal_eval(sanitized)
+```
+
+`re` was already imported in `viz_agent.py`. No new dependency required.
+
+**Files changed**: `backend/app/viz_agent.py`
+
+---
+
+## #31 — Query rewrite length guard discards valid rewrites for short follow-up questions
+
+**Symptom**
+Short follow-up messages like `"you forgot to plot"` or `"plot"` caused the query rewrite chain to produce a correct standalone question which was then discarded by the safety guard. The pipeline fell back to the raw 4-word original, passed it to the SQL generator, and received a completely wrong query (ducks query instead of Kohli batting average).
+
+Docker log:
+```
+WARNING | app.agent | Query rewrite produced a non-question — falling back to original.
+rewrite="Can you plot Virat Kohli's batting average in every IPL season?"
+INFO    | app.agent | Query rewrite | original='you forgot to plot' | standalone='you forgot to plot'
+```
+The rewrite was correct and ended with `?`. It was discarded because it was 3.5× the original length, exceeding the `3×` threshold.
+
+**Root cause**
+The safety guard used a **length ratio** as its second condition:
+```python
+_looks_like_answer = (
+    not standalone_question.strip().endswith("?")
+    or len(standalone_question) > 3 * len(question)
+)
+```
+A length ratio is the wrong tool for short inputs. For a 4-word original ("you forgot to plot", 18 chars), any meaningful rewrite ("Can you plot Virat Kohli's batting average in every IPL season?", 63 chars) exceeds a 3× multiplier. The threshold is arbitrary and fails proportionally worse as the original question gets shorter.
+
+**Why changing 3× to 5× is not a general fix**
+Increasing the multiplier only shifts the breakpoint — it does not eliminate the problem:
+- `"plot"` (4 chars) × 5 = 20 chars — even `"Can you plot the batting average?"` (34 chars) exceeds the threshold
+- `"why?"` (4 chars) × 5 = 20 chars — same failure mode
+- Any follow-up shorter than ~20 chars will still fail under a 5× rule
+
+The multiplier needs to grow as the original shrinks, but the right fix is to remove the ratio entirely.
+
+**Fix**
+The only reliable signal that the rewriter hallucinated an *answer* (vs. a valid question) is that answers are statements — they do not end with `?`. The `?` check already handles this correctly. The length ratio was redundant and harmful. It was replaced with a generous absolute ceiling (300 chars) that rejects multi-sentence paragraph-length outputs regardless of the original question length:
+
+```python
+# Before — ratio breaks for short originals
+_looks_like_answer = (
+    not standalone_question.strip().endswith("?")
+    or len(standalone_question) > 3 * len(question)
+)
+
+# After — absolute ceiling; ratio removed
+_looks_like_answer = (
+    not standalone_question.strip().endswith("?")
+    or len(standalone_question) > 300
+)
+```
+
+A 300-char ceiling is well above any legitimate standalone question rewrite (~60–120 chars) and well below a hallucinated multi-fact answer (~400+ chars). It is input-length-agnostic.
+
+**Files changed**: `backend/app/agent.py`
+
+---
+
+## #32 — MCP chart server Docker build takes 5+ minutes due to pip backtracking
+
+**Symptom**
+`docker compose up --build` appeared to hang for 5+ minutes on the `mcp_chart_server` pip install step. No error — it eventually succeeded, but silently wasted build time on every `--build`.
+
+**Root cause**
+`backend/requirements.txt` used loose lower-bound constraints: `pydantic-settings>=2.5.2` and `mcp>=1.4.0`. When pip resolves a `>=` constraint it downloads metadata for every available version from PyPI to find the best match. `mcp` had 10+ published versions and a deep transitive dependency tree. pip's backtracking resolver explored many combinations, causing the delay.
+
+**Fix**
+Pinned all direct dependencies to exact versions in `backend/requirements.txt`:
+```
+# Before
+pydantic-settings>=2.5.2
+mcp>=1.4.0
+
+# After
+pydantic-settings==2.7.0
+mcp==1.6.0
+```
+
+**Lesson**: Use `==` for all direct dependencies in Docker images. Loose lower bounds (`>=`) are appropriate for library `pyproject.toml` files; in a containerised service the image should be fully reproducible with pinned versions.
+
+**Files changed**: `backend/requirements.txt`
+
+---
+
+## #33 — `mcp==1.6.0` requires `pydantic>=2.7.2`; `backend/requirements.txt` had `pydantic==2.7.1`
+
+**Symptom**
+Docker build error after pinning `mcp==1.6.0`:
+```
+ERROR: Cannot install mcp==1.6.0 because these package versions have conflicting dependencies.
+mcp 1.6.0 depends on pydantic<3.0.0 and >=2.7.2
+```
+
+**Root cause**
+`backend/requirements.txt` had `pydantic==2.7.1`. `mcp==1.6.0` requires `pydantic>=2.7.2` (a one-patch bump). pip cannot satisfy both constraints simultaneously and aborts the build.
+
+**Fix**
+Bumped `pydantic==2.7.1` → `pydantic==2.7.2`. `pydantic-settings==2.7.0` requires only `pydantic>=2.7.0`, so it is satisfied by `2.7.2`.
+
+**Files changed**: `backend/requirements.txt`
+
+---
+
+## #34 — `FastMCP.run()` TypeError: `host` and `port` moved to constructor in `mcp==1.6.0`
+
+**Symptom**
+`mcp_chart_server` container crashed on startup immediately after a successful Docker build:
+```
+TypeError: FastMCP.run() got an unexpected keyword argument 'host'
+```
+Container entered a restart loop.
+
+**Root cause**
+`server.py` was written against an older `mcp` API where `host` and `port` were kwargs of `mcp.run()`:
+```python
+# Old API (pre-1.6.0)
+mcp = FastMCP("chart-server")
+mcp.run(transport="sse", host="0.0.0.0", port=8087)  # ← TypeError in 1.6.0
+```
+In `mcp==1.6.0` the `FastMCP` class signature changed: `host` and `port` are constructor arguments only and are no longer accepted by `run()`.
+
+**Fix**
+Moved `host` and `port` to the `FastMCP()` constructor. `run()` now takes only `transport`. `port` was promoted to module level so it is available at construction time:
+```python
+# After (mcp==1.6.0 API)
+port = int(os.getenv("PORT", "8087"))
+mcp = FastMCP("chart-server", host="0.0.0.0", port=port)
+...
+mcp.run(transport="sse")
+```
+
+**Files changed**: `mcp_chart_server/server.py`

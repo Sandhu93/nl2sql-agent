@@ -133,7 +133,10 @@ def _parse_result_to_rows(result: str, x_field: str, y_field: str) -> list[dict]
     JSON-serializable types (Decimal → float, etc.).
     """
     try:
-        rows = ast.literal_eval(result)
+        # psycopg2 renders Decimal values as Decimal('15.00') in the result string.
+        # ast.literal_eval cannot parse constructor calls, so strip them first.
+        sanitized = re.sub(r"Decimal\('([^']+)'\)", r"\1", result)
+        rows = ast.literal_eval(sanitized)
     except Exception:
         return []
 

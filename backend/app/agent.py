@@ -406,12 +406,18 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
             "history": rewrite_history,
             "question": question,
         })
-        # Safety guard: if the rewriter produced a statement instead of a question
-        # (hallucinated an answer), discard it and use the original question.
-        # A valid rewrite is short (< 3× the original) and ends with "?".
+        # Safety guard: discard the rewrite if the LLM answered the question
+        # instead of rewriting it.
+        #
+        # The "?" check is the reliable signal: hallucinated answers are statements,
+        # not questions. A length ratio (e.g. 3×, 5×) is the wrong tool — short
+        # follow-ups like "plot" or "you forgot to plot" legitimately expand into
+        # full standalone questions that exceed any fixed multiplier.
+        # We keep only a generous absolute ceiling (300 chars) to reject the rare
+        # case where the LLM emits a multi-sentence paragraph as a single "question".
         _looks_like_answer = (
             not standalone_question.strip().endswith("?")
-            or len(standalone_question) > 3 * len(question)
+            or len(standalone_question) > 300
         )
         if _looks_like_answer:
             logger.warning(
