@@ -27,3 +27,6 @@ chromadb==0.5.0
 
 # MCP client — Phase 9.5: calls the MCP chart server from viz_agent.py
 mcp==1.6.0
+
+# Redis — Phase 10: persistent conversation history (RedisChatMessageHistory)
+redis==5.0.4

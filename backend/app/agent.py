@@ -37,11 +37,13 @@ Pipeline
 """
 
 import asyncio
+import json
 import logging
 from typing import List
 
+import redis as redis_lib
 from langchain.chains import create_sql_query_chain
-from langchain_community.chat_message_histories import ChatMessageHistory
+from langchain_community.chat_message_histories import ChatMessageHistory, RedisChatMessageHistory
 from langchain_community.tools.sql_database.tool import QuerySQLDataBaseTool
 from langchain_community.utilities.sql_database import SQLDatabase
 from langchain_core.output_parsers import StrOutputParser
@@ -167,11 +169,91 @@ _rephrase_answer = None
 _select_table = None  # chain: {"question": str} → List[str] of relevant table names
 _rewrite_query = None  # chain: {"history": list, "question": str} → standalone question str
 
-# Per-thread conversation history (in-memory, lost on restart).
-# Keyed by thread_id so each browser session has its own message history.
-_conversation_histories: dict[str, ChatMessageHistory] = {}
-# Per-thread recent insight chips for cross-turn dedupe.
-_recent_follow_up_chips: dict[str, list[str]] = {}
+# ---------------------------------------------------------------------------
+# Redis-backed session storage — Phase 10
+#
+# Two keys per thread_id (both share the same TTL):
+#   nl2sql:{thread_id}        ← RedisChatMessageHistory (LangChain managed)
+#   nl2sql:chips:{thread_id}  ← JSON list of recent follow-up chips
+#
+# If Redis is unreachable at startup we fall back to plain in-memory dicts so
+# the app keeps working in local dev without a Redis instance running.
+# ---------------------------------------------------------------------------
+_redis_client: redis_lib.Redis | None = None
+_redis_available: bool = False
+
+# In-memory fallbacks (used only when Redis is unavailable).
+_in_memory_histories: dict[str, ChatMessageHistory] = {}
+_in_memory_chips: dict[str, list[str]] = {}
+
+
+def _init_redis() -> None:
+    """
+    Attempt a one-time connection to Redis. Sets _redis_available accordingly.
+
+    Called once inside _get_chain() during the first request so a missing Redis
+    instance surfaces as a warning, not a startup crash.
+    """
+    global _redis_client, _redis_available
+    if _redis_client is not None:
+        return  # already initialised
+    try:
+        client = redis_lib.from_url(settings.redis_url, socket_connect_timeout=2)
+        client.ping()
+        _redis_client = client
+        _redis_available = True
+        logger.info("Redis connected | url=%s | ttl=%ds", settings.redis_url, settings.redis_ttl_seconds)
+    except Exception as exc:
+        logger.warning(
+            "Redis unavailable — falling back to in-memory session storage | error=%s", exc
+        )
+        _redis_available = False
+
+
+def _get_history(thread_id: str) -> ChatMessageHistory | RedisChatMessageHistory:
+    """
+    Return the conversation history object for this session.
+
+    Uses RedisChatMessageHistory when Redis is available (persistent, survives
+    restarts, works across replicas). Falls back to an in-memory
+    ChatMessageHistory otherwise so local dev without Redis still works.
+    """
+    if _redis_available:
+        # TODO: bump TTL on each access by calling expire() after add_* if you
+        #       want a sliding-window TTL instead of a fixed one from creation.
+        return RedisChatMessageHistory(
+            session_id=f"nl2sql:{thread_id}",
+            url=settings.redis_url,
+            ttl=settings.redis_ttl_seconds,
+        )
+    if thread_id not in _in_memory_histories:
+        _in_memory_histories[thread_id] = ChatMessageHistory()
+    return _in_memory_histories[thread_id]
+
+
+def _get_recent_chips(thread_id: str) -> list[str]:
+    """Load the recent follow-up chips list for this session from Redis."""
+    if _redis_available and _redis_client:
+        raw = _redis_client.get(f"nl2sql:chips:{thread_id}")
+        if raw:
+            try:
+                return json.loads(raw)
+            except Exception:
+                pass
+        return []
+    return _in_memory_chips.get(thread_id, [])
+
+
+def _set_recent_chips(thread_id: str, chips: list[str]) -> None:
+    """Persist the recent follow-up chips list for this session to Redis."""
+    if _redis_available and _redis_client:
+        _redis_client.set(
+            f"nl2sql:chips:{thread_id}",
+            json.dumps(chips),
+            ex=settings.redis_ttl_seconds,
+        )
+    else:
+        _in_memory_chips[thread_id] = chips
 
 # Maximum number of LLM-driven correction attempts after a SQL execution error.
 _MAX_SQL_RETRIES = 2
@@ -241,6 +323,10 @@ def _get_chain():
 
     if _generate_query is not None:
         return _generate_query, _execute_query, _rephrase_answer, _select_table, _rewrite_query
+
+    # Initialise Redis once alongside the LangChain chains so all lazy
+    # singletons are set up together on the first request.
+    _init_redis()
 
     # --- Database connection ---
     # sample_rows_in_table_info: sends N real rows per table in the prompt so
@@ -381,13 +467,17 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
 
     generate_query, execute_query, rephrase_answer, select_table, rewrite_query = _get_chain()
 
-    # Retrieve (or create) the conversation history for this session.
-    # history.messages is [] on the first turn, which is fine — the
-    # MessagesPlaceholder simply adds nothing to the prompt.
-    if thread_id not in _conversation_histories:
-        _conversation_histories[thread_id] = ChatMessageHistory()
-        logger.info("New conversation history created | thread_id=%s", thread_id)
-    history = _conversation_histories[thread_id]
+    # Retrieve the conversation history for this session.
+    # RedisChatMessageHistory creates the key lazily on first write, so a new
+    # thread_id with no prior messages simply starts with an empty list.
+    # history.messages is [] on the first turn — MessagesPlaceholder adds nothing.
+    history = _get_history(thread_id)
+    logger.info(
+        "Session history loaded | thread_id=%s | backend=%s | turns=%d",
+        thread_id,
+        "redis" if _redis_available else "in-memory",
+        len(history.messages) // 2,
+    )
 
     # Step 0 — Rewrite follow-up questions into fully standalone queries.
     # The table-selector (Step 1) has no access to conversation history, so an
@@ -599,7 +689,7 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
     # the query rewriter may strip chart-related keywords (e.g. "show me a bar chart"
     # → "Who were the top 10 run scorers?"), causing viz intent to be silently lost.
     viz_requested = wants_visualization(question) or wants_visualization(standalone_question)
-    recent_chips = _recent_follow_up_chips.get(thread_id, [])
+    recent_chips = _get_recent_chips(thread_id)
 
     async def _maybe_chart() -> dict | None:
         """Run chart spec generation only when the question asks for a viz."""
@@ -631,7 +721,7 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
     for chip in [*recent_chips, *chips]:
         if chip and chip not in merged_recent:
             merged_recent.append(chip)
-    _recent_follow_up_chips[thread_id] = merged_recent[-6:]
+    _set_recent_chips(thread_id, merged_recent[-6:])
 
     # Update conversation history so the next turn in this session can
     # reference what was asked and answered here.

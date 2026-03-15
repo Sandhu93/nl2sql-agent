@@ -2,6 +2,7 @@
 # NL2SQL Agent — Docker Compose (development)
 #
 # Services:
+#   redis            — Redis 7 on port 6379                   ← Phase 10
 #   mcp_chart_server — MCP chart server (SSE) on port 8087   ← Phase 9.5
 #   backend          — FastAPI on port 8086
 #   frontend         — Next.js on port 8085
@@ -15,7 +16,36 @@ networks:
   app_net:
     driver: bridge
 
+volumes:
+  redis_data:   # persists RDB snapshots across container restarts
+
 services:
+  # --------------------------------------------------------------------------
+  # Redis — Phase 10: persistent conversation history
+  # Stores per-session ChatMessageHistory and follow-up chips so they survive
+  # backend restarts and work correctly across multiple backend replicas.
+  # --------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: nl2sql_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: >
+      redis-server
+      --save 60 1
+      --loglevel warning
+    networks:
+      - app_net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
   # --------------------------------------------------------------------------
   # MCP Chart Server — Phase 9.5
   # Deterministic Vega-Lite spec generation exposed as an MCP tool over SSE.
@@ -62,6 +92,9 @@ services:
       # MCP chart server URL — internal Docker DNS name
       # TODO: Update to external URL if mcp_chart_server is deployed separately.
       - MCP_CHART_SERVER_URL=http://mcp_chart_server:8087
+      # Redis URL — internal Docker DNS name (Phase 10)
+      # Override in .env for local dev: REDIS_URL=redis://localhost:6379/0
+      - REDIS_URL=redis://redis:6379/0
     volumes:
       # Hot-reload: mount source code so uvicorn --reload picks up changes.
       - ./backend/app:/app/app
@@ -69,6 +102,8 @@ services:
       - app_net
     depends_on:
       mcp_chart_server:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     restart: unless-stopped
     healthcheck:

@@ -41,6 +41,20 @@ class Settings(BaseSettings):
         description="Base URL of the MCP chart server (SSE endpoint = /sse)",
     )
 
+    # Redis — Phase 10: persistent conversation history
+    # Internal Docker URL when running via docker-compose.
+    # Override in .env for local dev: REDIS_URL=redis://localhost:6379/0
+    redis_url: str = Field(
+        default="redis://redis:6379/0",
+        description="Redis connection URL (used for RedisChatMessageHistory)",
+    )
+    # Session TTL in seconds. After this period Redis auto-expires history and
+    # chip keys so stale sessions don't accumulate indefinitely.
+    redis_ttl_seconds: int = Field(
+        default=86400,  # 24 hours
+        description="TTL (seconds) for Redis session keys (history + chips)",
+    )
+
     # CORS
     allowed_origins: list[str] = Field(
         default=["http://localhost:8085"],
