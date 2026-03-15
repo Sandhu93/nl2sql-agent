@@ -41,6 +41,14 @@ class Settings(BaseSettings):
         description="Base URL of the MCP chart server (SSE endpoint = /sse)",
     )
 
+    # Rate limiting — Phase 10 (production hardening)
+    # Per-IP request cap on /api/query. Override in .env for higher limits
+    # during trusted internal testing, or lower limits for public exposure.
+    rate_limit_per_minute: int = Field(
+        default=20,
+        description="Maximum requests per IP per minute on /api/query",
+    )
+
     # Redis — Phase 10: persistent conversation history
     # Internal Docker URL when running via docker-compose.
     # Override in .env for local dev: REDIS_URL=redis://localhost:6379/0

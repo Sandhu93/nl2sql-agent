@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from typing import Any
 import logging
@@ -7,13 +7,16 @@ import asyncio
 from openai import RateLimitError
 
 from app.agent import run_agent
+from app.config import get_settings
 from app.input_validator import validate_question
+from app.limiter import limiter
 
 # Maximum time (seconds) a single /api/query request is allowed to run.
 _REQUEST_TIMEOUT = 60
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+settings = get_settings()
 
 
 class QueryRequest(BaseModel):
@@ -38,14 +41,19 @@ class QueryResponse(BaseModel):
     summary="Run NL2SQL agent",
     description="Accepts a natural-language question and returns an answer with the generated SQL.",
 )
-async def query_endpoint(body: QueryRequest) -> QueryResponse:
+@limiter.limit(f"{settings.rate_limit_per_minute}/minute")
+async def query_endpoint(request: Request, body: QueryRequest) -> QueryResponse:
     """
     POST /api/query
+
+    Rate limited to RATE_LIMIT_PER_MINUTE requests per IP per minute (default: 20).
+    Exceeding the limit returns HTTP 429. The limit is enforced via Redis so it
+    is consistent across multiple backend replicas.
 
     TODO: The actual agent logic lives in ``app/agent.py``.
           Extend ``run_agent`` there to plug in the LangGraph implementation.
     """
-    logger.info("POST /api/query | thread_id=%s", body.thread_id)
+    logger.info("POST /api/query | thread_id=%s | ip=%s", body.thread_id, request.client.host if request.client else "unknown")
 
     # Layer 1 — Input validation: sanitize and check for prompt injection
     # before the question reaches the LLM.  Returns a 400 so the client

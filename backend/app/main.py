@@ -4,8 +4,11 @@ import logging.config
 from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 
 from app.config import get_settings
+from app.limiter import limiter
 from app.routes.query import router as query_router
 
 # ---------------------------------------------------------------------------
@@ -36,6 +39,15 @@ app = FastAPI(
 )
 
 # ---------------------------------------------------------------------------
+# Rate limiting — Phase 10 (production hardening)
+# slowapi requires the limiter on app.state so the @limiter.limit() decorator
+# can find it at request time.  The SlowAPIMiddleware intercepts the request
+# before it reaches the route handler and enforces the per-IP counter.
+# ---------------------------------------------------------------------------
+app.state.limiter = limiter
+app.add_middleware(SlowAPIMiddleware)
+
+# ---------------------------------------------------------------------------
 # CORS — restricted to the frontend origin only
 # ---------------------------------------------------------------------------
 app.add_middleware(
@@ -55,6 +67,32 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={"detail": "An unexpected error occurred. Please try again later."},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Rate limit exceeded handler — Phase 10
+# Returns {"detail": "..."} consistent with our other 429 responses
+# (e.g. OpenAI RateLimitError in routes/query.py).
+# slowapi's built-in handler returns {"error": "..."} — we override it
+# so the frontend only needs to handle one error shape.
+# ---------------------------------------------------------------------------
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
+    logger.warning(
+        "Rate limit exceeded | ip=%s | limit=%s | path=%s",
+        request.client.host if request.client else "unknown",
+        exc.limit,
+        request.url.path,
+    )
+    return JSONResponse(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        content={
+            "detail": (
+                f"Too many requests — you are limited to {exc.limit} on this endpoint. "
+                "Please wait a moment and try again."
+            )
+        },
     )
 
 # ---------------------------------------------------------------------------

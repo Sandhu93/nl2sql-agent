@@ -30,3 +30,6 @@ mcp==1.6.0
 
 # Redis — Phase 10: persistent conversation history (RedisChatMessageHistory)
 redis==5.0.4
+
+# Rate limiting — Phase 10 (production hardening): per-IP slowapi middleware
+slowapi==0.1.9

@@ -1031,3 +1031,36 @@ mcp.run(transport="sse")
 ```
 
 **Files changed**: `mcp_chart_server/server.py`
+
+---
+
+## Phase 10 — Redis Persistent History: No Bugs
+
+The Redis implementation (2026-03-16) was a clean feature addition with no bugs encountered during development.
+
+**Changes made:**
+- `docker-compose.yml` — added `redis:7-alpine` service with `--save 60 1` persistence and health check; `backend` `depends_on` redis
+- `backend/requirements.txt` — added `redis==5.0.4`
+- `backend/app/config.py` — added `redis_url` + `redis_ttl_seconds` settings
+- `backend/app/agent.py` — replaced `_conversation_histories` dict with `RedisChatMessageHistory`; replaced `_recent_follow_up_chips` dict with Redis JSON keys; added `_init_redis()`, `_get_history()`, `_get_recent_chips()`, `_set_recent_chips()` helpers; graceful in-memory fallback if Redis is unreachable
+
+**Design decisions that prevented bugs:**
+- 2-second `socket_connect_timeout` on `_init_redis()` so a missing Redis instance fails fast and triggers the fallback, not a hang
+- `_redis_available` flag set once at startup — no per-request connection checks that could race
+- `RedisChatMessageHistory` creates the Redis key lazily on first `add_*` write, so new threads with no history just start with an empty list — no explicit "create if not exists" logic needed
+
+## Per-IP Rate Limiting: No Bugs
+
+The slowapi rate limiting implementation (2026-03-16) was a clean feature addition with no bugs encountered.
+
+**Changes made:**
+- `backend/requirements.txt` — added `slowapi==0.1.9`
+- `backend/app/config.py` — added `rate_limit_per_minute: int = 20`
+- `backend/app/limiter.py` (new) — singleton `Limiter` with Redis backend + in-memory fallback
+- `backend/app/main.py` — `app.state.limiter = limiter`, `SlowAPIMiddleware`, custom `RateLimitExceeded` handler returning `{"detail": "..."}` consistent with our other 429 responses
+- `backend/app/routes/query.py` — added `request: Request` param (required by slowapi), `@limiter.limit(f"{settings.rate_limit_per_minute}/minute")` decorator
+
+**Design decisions:**
+- Limiter singleton in its own `limiter.py` module (not `main.py`) avoids circular imports — both `main.py` and `routes/query.py` import from it
+- Custom `RateLimitExceeded` handler (not slowapi's built-in `_rate_limit_exceeded_handler`) keeps all 429 responses in `{"detail": "..."}` format — the frontend only needs to handle one error shape
+- `RATE_LIMIT_PER_MINUTE` is a config setting, not a hardcoded constant — easy to raise/lower per environment without a code change
