@@ -611,14 +611,21 @@ class QueryResponse(BaseModel):
 | Phase 9 | Visualization layer (LLM-generated Vega-Lite specs) | ✅ Done |
 | Phase 9.2 | Correctness evaluation framework (50-question test suite, eval.py, eval_report.md) | ✅ Done |
 
+### Completed Since PRD Draft
+
+| Phase    | Scope                                               | Status    |
+|----------|-----------------------------------------------------|-----------|
+| Phase 9.5 | Visualization migration to MCP chart server        | ✅ Done   |
+| Phase 10 | Redis persistent history + per-IP rate limiting     | ✅ Done   |
+| Phase 11 | Semaphore + response cache + circuit breaker        | ✅ Done   |
+
 ### Planned Phases
 
 | Phase    | Scope                                               | Dependencies     | Estimated Effort |
 |----------|-----------------------------------------------------|------------------|------------------|
-| Phase 9.5 | Visualization migration to MCP chart server        | Phase 9          | Medium           |
-| Phase 10 | Multi-modal report agent                            | Phase 8 + 9      | Large            |
-| Phase 11 | Streaming responses (SSE)                           | None             | Medium           |
-| Phase 12 | Authentication + multi-user                         | None             | Medium           |
+| Phase 12 | Multi-modal report agent                            | Phase 8 + 9.5    | Large            |
+| Phase 13 | Streaming responses (SSE/NDJSON)                    | None             | Medium           |
+| Phase 14 | Authentication + multi-user                         | None             | Medium           |
 
 ### Phase Dependency Graph
 

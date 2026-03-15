@@ -37,8 +37,11 @@ Pipeline
 """
 
 import asyncio
+import hashlib
 import json
 import logging
+import re
+import time
 from typing import List
 
 import redis as redis_lib
@@ -255,6 +258,133 @@ def _set_recent_chips(thread_id: str, chips: list[str]) -> None:
     else:
         _in_memory_chips[thread_id] = chips
 
+# ---------------------------------------------------------------------------
+# LLM concurrency limiter — Phase 11 (production hardening)
+#
+# A single asyncio.Semaphore shared across all concurrent requests limits the
+# number of simultaneous in-flight LLM API calls.  Without this, 10 users
+# hitting Step 2 (SQL generation) at the same moment send 10 GPT-4o requests
+# simultaneously, exhausting OpenAI's TPM limit in seconds and triggering a
+# cascade of 429s and retry storms.
+#
+# All direct .ainvoke() calls in this module go through _llm_invoke() which
+# acquires the semaphore first.  generate_insights() and generate_chart_spec()
+# (separate modules, 1 cheap LLM call each) are not guarded here — they are
+# non-blocking/silent-failure helpers and their load is lower priority.
+# TODO: pass the semaphore into insights_agent and viz_agent if their LLM call
+#       volume becomes significant under heavier load.
+# ---------------------------------------------------------------------------
+_llm_semaphore: asyncio.Semaphore | None = None
+
+# ---------------------------------------------------------------------------
+# Circuit breaker — Phase 11 (production hardening)
+#
+# Tracks consecutive LLM chain failures (primary + all fallbacks exhausted).
+# After FAILURE_THRESHOLD failures in a row the circuit "opens" and all LLM
+# calls are rejected immediately for COOLDOWN_SECONDS, returning HTTP 503 to
+# the client rather than queuing more doomed requests against an unavailable
+# provider.  After the cooldown the circuit goes "half-open": the next call
+# is allowed through; success resets the counter, failure reopens the circuit.
+#
+# Configured via settings.llm_circuit_failure_threshold /
+# settings.llm_circuit_cooldown_seconds (see config.py + .env.example).
+#
+# State is in-process (single replica).
+# TODO: move _circuit_failures and _circuit_open_until to Redis so multiple
+#       backend replicas share a consistent view of provider health.
+# ---------------------------------------------------------------------------
+
+
+class LLMCircuitOpenError(RuntimeError):
+    """Raised by _llm_invoke when the circuit breaker is open."""
+
+
+_circuit_failures: int = 0
+_circuit_open_until: float = 0.0
+
+
+def _is_circuit_open() -> bool:
+    return time.time() < _circuit_open_until
+
+
+def _circuit_record_success() -> None:
+    global _circuit_failures
+    if _circuit_failures > 0:
+        logger.info("LLM circuit breaker reset | had %d consecutive failure(s)", _circuit_failures)
+    _circuit_failures = 0
+
+
+def _circuit_record_failure() -> None:
+    global _circuit_failures, _circuit_open_until
+    _circuit_failures += 1
+    logger.warning(
+        "LLM call failed | consecutive_failures=%d | threshold=%d",
+        _circuit_failures,
+        settings.llm_circuit_failure_threshold,
+    )
+    if _circuit_failures >= settings.llm_circuit_failure_threshold:
+        _circuit_open_until = time.time() + settings.llm_circuit_cooldown_seconds
+        logger.error(
+            "LLM circuit breaker OPENED | consecutive_failures=%d | cooldown=%ds | open_until=%s",
+            _circuit_failures,
+            settings.llm_circuit_cooldown_seconds,
+            time.strftime("%H:%M:%S", time.localtime(_circuit_open_until)),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Response cache — Phase 11 (production hardening)
+#
+# Caches full responses for first-turn questions (no thread history) in Redis
+# with a short TTL.  Follow-up questions are NEVER cached because their answers
+# depend on the per-thread conversation history.
+#
+# Cache key: "nl2sql:cache:" + SHA-256(normalised question)
+# Normalisation: lowercase + collapse whitespace — so "Who has the most runs?"
+# and "who has the most runs ?" map to the same key.
+#
+# TTL is configurable via settings.cache_ttl_seconds (default: 3600 = 1h).
+# IPL data doesn't change, so 1h is safe. Shorten for mutable datasets.
+# ---------------------------------------------------------------------------
+
+
+def _cache_key(question: str) -> str:
+    """Return the Redis key for a cached question response."""
+    normalized = re.sub(r"\s+", " ", question.lower().strip())
+    return "nl2sql:cache:" + hashlib.sha256(normalized.encode()).hexdigest()
+
+
+async def _llm_invoke(chain, inputs: dict):
+    """
+    Central LLM call gate: checks the circuit breaker, acquires the concurrency
+    semaphore, invokes the chain, and records success/failure for the breaker.
+
+    Every LLM .ainvoke() in this module goes through this helper so both the
+    semaphore cap and the circuit breaker are enforced at a single point.
+    """
+    if _is_circuit_open():
+        logger.warning("LLM circuit breaker is open — rejecting call immediately")
+        raise LLMCircuitOpenError(
+            "All LLM providers are temporarily unavailable. Please try again shortly."
+        )
+
+    async def _invoke():
+        try:
+            result = await chain.ainvoke(inputs)
+            _circuit_record_success()
+            return result
+        except LLMCircuitOpenError:
+            raise  # don't double-count
+        except Exception:
+            _circuit_record_failure()
+            raise
+
+    if _llm_semaphore is None:
+        return await _invoke()
+    async with _llm_semaphore:
+        return await _invoke()
+
+
 # Maximum number of LLM-driven correction attempts after a SQL execution error.
 _MAX_SQL_RETRIES = 2
 
@@ -313,7 +443,7 @@ async def _fix_sql(
             ),
         ]
     )
-    raw = await (fix_prompt | _llm | StrOutputParser()).ainvoke({})
+    raw = await _llm_invoke(fix_prompt | _llm | StrOutputParser(), {})
     return _clean_sql(raw)
 
 
@@ -324,9 +454,14 @@ def _get_chain():
     if _generate_query is not None:
         return _generate_query, _execute_query, _rephrase_answer, _select_table, _rewrite_query
 
-    # Initialise Redis once alongside the LangChain chains so all lazy
-    # singletons are set up together on the first request.
+    # Initialise Redis and the LLM semaphore once alongside the LangChain
+    # chains so all lazy singletons are set up together on the first request.
     _init_redis()
+
+    global _llm_semaphore
+    if _llm_semaphore is None:
+        _llm_semaphore = asyncio.Semaphore(settings.llm_max_concurrency)
+        logger.info("LLM semaphore initialised | max_concurrency=%d", settings.llm_max_concurrency)
 
     # --- Database connection ---
     # sample_rows_in_table_info: sends N real rows per table in the prompt so
@@ -472,12 +607,28 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
     # thread_id with no prior messages simply starts with an empty list.
     # history.messages is [] on the first turn — MessagesPlaceholder adds nothing.
     history = _get_history(thread_id)
+    is_first_turn = not bool(history.messages)
     logger.info(
         "Session history loaded | thread_id=%s | backend=%s | turns=%d",
         thread_id,
         "redis" if _redis_available else "in-memory",
         len(history.messages) // 2,
     )
+
+    # Cache lookup — only for first-turn questions (follow-up answers are
+    # thread-specific and must never be served from a shared cache).
+    # On a hit we still update history so the next follow-up has context.
+    if is_first_turn and _redis_available and _redis_client:
+        try:
+            cached_raw = _redis_client.get(_cache_key(question))
+            if cached_raw:
+                cached_result = json.loads(cached_raw)
+                logger.info("Cache hit | thread_id=%s | question=%r", thread_id, question)
+                history.add_user_message(question)
+                history.add_ai_message(cached_result.get("answer", ""))
+                return cached_result
+        except Exception as exc:
+            logger.warning("Cache lookup failed (non-blocking): %s", exc)
 
     # Step 0 — Rewrite follow-up questions into fully standalone queries.
     # The table-selector (Step 1) has no access to conversation history, so an
@@ -492,7 +643,7 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
         # Keep a wider rewrite window so follow-ups over longer threads still
         # resolve correctly. We avoid full history to reduce drift.
         rewrite_history = history.messages[-8:]
-        standalone_question: str = await rewrite_query.ainvoke({
+        standalone_question: str = await _llm_invoke(rewrite_query, {
             "history": rewrite_history,
             "question": question,
         })
@@ -539,7 +690,7 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
     #       question absorbs the one-time cost transparently.
     available_tables = set(_db.get_usable_table_names())
     raw_selection, cricket_context = await asyncio.gather(
-        select_table.ainvoke({"question": resolved_question}),
+        _llm_invoke(select_table, {"question": resolved_question}),
         retrieve_cricket_rules(resolved_question, k=3),
     )
 
@@ -558,7 +709,7 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
     # We intentionally do NOT pass full chat history to SQL generation.
     # Follow-up references are already resolved in Step 0 (rewrite), and
     # long message history causes factual drift/hallucination in later turns.
-    raw: str = await generate_query.ainvoke({
+    raw: str = await _llm_invoke(generate_query, {
         "question": resolved_question,
         "table_names_to_use": table_names,
         "messages": [],
@@ -697,8 +848,10 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
             return None
         return await generate_chart_spec(standalone_question, result, _llm)
 
+    # TODO: pass _llm_semaphore into generate_insights / generate_chart_spec if
+    #       their LLM call volume becomes significant under heavier load.
     answer, insights, chart_spec = await asyncio.gather(
-        rephrase_answer.ainvoke({
+        _llm_invoke(rephrase_answer, {
             "question": standalone_question,
             "query": sql,
             "result": result,
@@ -733,4 +886,20 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
         len(history.messages) // 2,
     )
 
-    return {"answer": answer, "sql": sql, "insights": insights, "chart_spec": chart_spec}
+    result_payload = {"answer": answer, "sql": sql, "insights": insights, "chart_spec": chart_spec}
+
+    # Cache write — only for first-turn questions.
+    # Follow-up answers depend on thread history and must NOT be cached globally.
+    # TODO: add a cache invalidation hook here if the underlying DB data changes.
+    if is_first_turn and _redis_available and _redis_client:
+        try:
+            _redis_client.set(
+                _cache_key(question),
+                json.dumps(result_payload, default=str),
+                ex=settings.cache_ttl_seconds,
+            )
+            logger.info("Cache write | ttl=%ds", settings.cache_ttl_seconds)
+        except Exception as exc:
+            logger.warning("Cache write failed (non-blocking): %s", exc)
+
+    return result_payload

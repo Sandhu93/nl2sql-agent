@@ -49,6 +49,35 @@ class Settings(BaseSettings):
         description="Maximum requests per IP per minute on /api/query",
     )
 
+    # LLM concurrency — Phase 11 (production hardening)
+    # Maximum simultaneous in-flight LLM API calls across all requests.
+    # At ~1,000 tokens/call and a 30,000 TPM limit, 5 concurrent calls is safe.
+    # Lower for shared/free-tier keys; raise for dedicated high-TPM keys.
+    llm_max_concurrency: int = Field(
+        default=5,
+        description="Maximum concurrent LLM API calls (semaphore cap)",
+    )
+
+    # Response cache — Phase 11 (production hardening)
+    # TTL for cached first-turn question responses. Follow-up questions are
+    # never cached because their answers depend on per-thread history.
+    cache_ttl_seconds: int = Field(
+        default=3600,  # 1 hour
+        description="TTL (seconds) for cached first-turn question responses",
+    )
+
+    # Circuit breaker — Phase 11 (production hardening)
+    # Opens the circuit (rejects all LLM calls) after this many consecutive
+    # failures (primary + all fallbacks exhausted). Closes after the cooldown.
+    llm_circuit_failure_threshold: int = Field(
+        default=5,
+        description="Consecutive LLM failures before circuit breaker opens",
+    )
+    llm_circuit_cooldown_seconds: int = Field(
+        default=60,
+        description="Seconds the circuit stays open before allowing a probe",
+    )
+
     # Redis — Phase 10: persistent conversation history
     # Internal Docker URL when running via docker-compose.
     # Override in .env for local dev: REDIS_URL=redis://localhost:6379/0

@@ -1064,3 +1064,52 @@ The slowapi rate limiting implementation (2026-03-16) was a clean feature additi
 - Limiter singleton in its own `limiter.py` module (not `main.py`) avoids circular imports — both `main.py` and `routes/query.py` import from it
 - Custom `RateLimitExceeded` handler (not slowapi's built-in `_rate_limit_exceeded_handler`) keeps all 429 responses in `{"detail": "..."}` format — the frontend only needs to handle one error shape
 - `RATE_LIMIT_PER_MINUTE` is a config setting, not a hardcoded constant — easy to raise/lower per environment without a code change
+
+## Phase 11 — Semaphore + Response Cache + Circuit Breaker: No Bugs
+
+Three production hardening features added (2026-03-16) with no bugs encountered.
+
+### LLM Concurrency Semaphore
+
+**What it does:** caps simultaneous in-flight LLM API calls across all concurrent requests to prevent OpenAI TPM exhaustion.
+
+**Changes made:**
+- `backend/app/config.py` — added `llm_max_concurrency: int = 5`
+- `backend/app/agent.py` — added `_llm_semaphore: asyncio.Semaphore | None`, initialized in `_get_chain()`; added `_llm_invoke(chain, inputs)` helper that all `.ainvoke()` calls route through; semaphore is acquired before every LLM network call
+- `backend/.env.example` — documented `LLM_MAX_CONCURRENCY=5`
+
+**Design decisions:**
+- Semaphore is a module-level None initialized lazily in `_get_chain()` (alongside other singletons) so the value is read from settings at first-request time, not import time
+- `_llm_invoke()` helper — single point of enforcement; all five LLM call sites in `agent.py` use it; `generate_insights` / `generate_chart_spec` (separate files, 1 cheap call each) are left unguarded with a TODO
+- Safe fallback: if semaphore is None (defensive), `_llm_invoke` does a direct `.ainvoke()` rather than crashing
+
+### Response Cache
+
+**What it does:** caches full first-turn responses in Redis with a 1-hour TTL so repeated identical questions are instant and free.
+
+**Changes made:**
+- `backend/app/config.py` — added `cache_ttl_seconds: int = 3600`
+- `backend/app/agent.py` — added `_cache_key(question)` (SHA-256 of normalised question); cache hit check immediately after history load (first-turn only); cache write before the final return; history is still updated on cache hit so follow-ups have context
+- `backend/.env.example` — documented `CACHE_TTL_SECONDS=3600`
+
+**Design decisions:**
+- Only first-turn questions are cached (`is_first_turn = not bool(history.messages)`). Follow-up answers depend on per-thread history and are thread-specific — caching them globally would return the wrong answer.
+- Cache key normalisation (lowercase + collapse whitespace) means "who has most runs?" and "Who has most runs ?" hit the same key
+- `json.dumps(result_payload, default=str)` — `default=str` as a safety net for any non-serializable types in chart specs
+- Cache read/write failures are non-blocking (caught and logged as warnings) — Redis outage never breaks the main pipeline
+
+### Circuit Breaker
+
+**What it does:** after N consecutive LLM chain failures (all providers exhausted), stops sending calls to the LLM for a cooldown period, returning HTTP 503 immediately instead of queuing more doomed requests.
+
+**Changes made:**
+- `backend/app/config.py` — added `llm_circuit_failure_threshold: int = 5`, `llm_circuit_cooldown_seconds: int = 60`
+- `backend/app/agent.py` — added `LLMCircuitOpenError` exception class; `_circuit_failures` + `_circuit_open_until` module-level state; `_is_circuit_open()`, `_circuit_record_success()`, `_circuit_record_failure()` helpers; circuit check + failure recording wired into `_llm_invoke()`
+- `backend/app/routes/query.py` — imports `LLMCircuitOpenError`; added `except LLMCircuitOpenError` returning HTTP 503 before the generic 500 catch
+- `backend/.env.example` — documented `LLM_CIRCUIT_FAILURE_THRESHOLD=5`, `LLM_CIRCUIT_COOLDOWN_SECONDS=60`
+
+**Design decisions:**
+- `LLMCircuitOpenError` is a named exception (not a string check) so `routes/query.py` can return 503 specifically, not 500
+- `except LLMCircuitOpenError: raise` inside `_invoke()` prevents double-counting the failure when the open check inside an already-open call races
+- Circuit state is in-process (single replica). TODO: move to Redis for multi-replica consistency
+- `_circuit_record_success()` resets the counter on any successful call — the circuit goes half-open automatically (next call after cooldown is the probe; success resets, failure reopens)

@@ -6,7 +6,7 @@ import logging
 import asyncio
 from openai import RateLimitError
 
-from app.agent import run_agent
+from app.agent import run_agent, LLMCircuitOpenError
 from app.config import get_settings
 from app.input_validator import validate_question
 from app.limiter import limiter
@@ -77,6 +77,12 @@ async def query_endpoint(request: Request, body: QueryRequest) -> QueryResponse:
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
             detail=f"Request timed out after {_REQUEST_TIMEOUT}s. The LLM provider may be overloaded.",
         )
+    except LLMCircuitOpenError as exc:
+        logger.warning("LLM circuit open | thread_id=%s: %s", body.thread_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
     except RateLimitError as exc:
         logger.warning("Rate limit hit for thread_id=%s: %s", body.thread_id, exc)
         raise HTTPException(
