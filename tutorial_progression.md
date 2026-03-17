@@ -1178,3 +1178,126 @@ Expected SQL had 2 columns (bowler + economy_rate) but the question asks for a s
 | 32 | Match scorecard — expected 4 cols (batting_team, inning, runs, wickets), model returns 3 | Model omits wickets_lost column |
 | 42 | Win percentage — model returns 4 cols vs expected 2 | Batting average few-shot teaches debug-column pattern; risky to fix |
 | 46 | Death overs wickets — fixed in Round 2 | ✅ Resolved |
+
+---
+
+## Phase 10 — Redis Persistent History + Per-IP Rate Limiting
+
+**Goal:** Replace ephemeral in-memory session state with Redis-backed persistence; add per-IP rate limiting for production hardening.
+
+### What was built
+
+**Redis persistent session storage**
+
+| Component | Before | After |
+|---|---|---|
+| Conversation history | `dict[thread_id, ChatMessageHistory]` (in-process) | `RedisChatMessageHistory(session_id="nl2sql:{thread_id}", ttl=86400)` |
+| Follow-up chips | `dict[thread_id, list[str]]` (in-process) | `redis.get/set("nl2sql:chips:{thread_id}", ex=86400)` |
+| Persistence | Lost on backend restart | Survives restarts; consistent across replicas |
+
+- `_init_redis()` — lazy singleton called once in `_get_chain()`. Sets `_redis_available` flag; logs warning and falls back to in-memory dicts if `redis.ping()` fails.
+- `_get_history(thread_id)` — returns `RedisChatMessageHistory` when Redis is available, `ChatMessageHistory` otherwise.
+- `_get_recent_chips` / `_set_recent_chips` — JSON-serialised list at `nl2sql:chips:{thread_id}`.
+- `redis==5.0.4` added to `requirements.txt`; `redis_url` + `redis_ttl_seconds` added to `config.py` and `.env.example`.
+
+**Per-IP rate limiting**
+
+- `limiter.py` — singleton `slowapi.Limiter` built at module import time. Prefers Redis storage (cross-replica consistent counter); falls back to in-memory if Redis is unavailable.
+- `@limiter.limit(f"{settings.rate_limit_per_minute}/minute")` on `POST /api/query`.
+- Custom `RateLimitExceeded` handler in `main.py` returns `{"detail": "Too many requests..."}` — same shape as other error responses.
+- `rate_limit_per_minute: int = 20` in `config.py`; `RATE_LIMIT_PER_MINUTE` in `.env.example`.
+
+**Docker**
+
+- `redis:7-alpine` service added to `docker-compose.yml` with named volume `redis_data:/data` and `--save 60 1` (RDB snapshot every 60s).
+- `backend` `depends_on: redis: condition: service_healthy`.
+
+### Key architectural decision
+
+`_init_redis()` is lazy (called on first request, not at startup) so a missing Redis instance surfaces as a warning, not a startup crash. The app continues working in local dev without Redis — in-memory fallback handles all session state.
+
+### Bugs fixed
+
+None during implementation. Bug #38 (`.env` REDIS_URL pointing to localhost instead of Docker service name) was discovered later during cache verification.
+
+---
+
+## Phase 11 — LLM Concurrency Semaphore + Response Cache + Circuit Breaker
+
+**Goal:** Harden the backend against OpenAI TPM exhaustion, repeated identical queries, and cascading LLM failures under concurrent load.
+
+### What was built
+
+**LLM concurrency semaphore**
+
+- `_llm_semaphore = asyncio.Semaphore(settings.llm_max_concurrency)` — initialised once in `_get_chain()`.
+- `_llm_invoke(chain, inputs)` helper — all `.ainvoke()` calls in `agent.py` route through it. Semaphore acquired inside; circuit breaker checked before acquire.
+- `llm_max_concurrency: int = 5` default — safe at OpenAI's 30k TPM limit with ~1k tokens/call.
+- `generate_insights` and `generate_chart_spec` (separate modules) left unguarded for now (lower call volume); TODO to pass semaphore in if needed.
+
+**Response cache**
+
+- Cache key: `"nl2sql:cache:" + SHA-256(normalised question)` — normalisation is lowercase + collapse whitespace so minor variants map to the same key.
+- Only first-turn questions are cached (`is_first_turn = not bool(history.messages)`). Follow-up answers are thread-specific and never cached.
+- On cache hit: return immediately AND update history so the next follow-up still has context.
+- Cache write: `json.dumps(result_payload, default=str)` with TTL = `settings.cache_ttl_seconds` (default 3600s).
+- Non-blocking: read/write failures caught and logged as warnings — never crash the pipeline.
+
+**Circuit breaker**
+
+- `LLMCircuitOpenError(RuntimeError)` raised by `_llm_invoke` when circuit is open.
+- `_circuit_failures: int` and `_circuit_open_until: float` — module-level state.
+- Opens after `settings.llm_circuit_failure_threshold` (default 5) consecutive failures (primary + all fallbacks exhausted).
+- Stays open for `settings.llm_circuit_cooldown_seconds` (default 60s), then goes half-open.
+- `routes/query.py` catches `LLMCircuitOpenError` → HTTP 503.
+- State is in-process (single replica); TODO: move to Redis for multi-replica consistency.
+
+### Bugs fixed
+
+None during implementation.
+
+---
+
+## Phase 12 — Model Routing + Prompt Engineering (Latency + Accuracy)
+
+**Goal:** Reduce per-request latency by routing lightweight LLM steps to GPT-4o-mini; fix hallucination patterns observed in production queries.
+
+### Latency problem
+
+Observed ~7s per request with GPT-4o on all steps. Root cause: 5 sequential/parallel LLM calls all using the same slow, expensive model. GPT-4o-mini is ~3–5× faster and ~15× cheaper for steps that don't require deep SQL reasoning.
+
+### Model routing
+
+Two-tier LLM strategy:
+
+| Model | Steps | Rationale |
+|---|---|---|
+| `gpt-4o` (`_llm`) | SQL generation, SQL fixing | Accuracy-critical; wrong SQL is a hard failure |
+| `gpt-4o-mini` (`_fast_llm`) | Query rewrite, table selection, answer rephrase, insights, chart intent | Latency-sensitive; errors are soft (graceful fallback) |
+
+- `_fast_llm` falls back to `gpt-4o` if mini is unavailable (`.with_fallbacks([...])`)
+- `openai_model` and `openai_fast_model` settings added to `config.py` with defaults `gpt-4o` / `gpt-4o-mini`; `OPENAI_MODEL` / `OPENAI_FAST_MODEL` added to `.env.example`
+
+### Prompt engineering fixes (Bugs #35–#37)
+
+Three hallucination patterns fixed via targeted system prompt additions to `prompts.py`:
+
+**HISTORICAL DATA block**
+Prevents "currently playing" framing. Instructs LLM to use `ORDER BY year DESC, match_id DESC LIMIT 1` pattern and qualify temporal claims as "most recently" / "based on available IPL data".
+
+**PLAYER NAME RESOLUTION block**
+Prevents empty results when LLM re-resolves a known abbreviated name via the `players` table with a wrong full name. Rule: if the abbreviated short name is already known from context, filter `deliveries.batsman` / `playing_xi.player_name` directly — do NOT re-resolve via `players` table.
+
+**DATA LIMITATIONS block**
+Lists awards/stats not stored in the database (`player_of_series`, `Orange Cap` as a stored column, player auction prices, etc.). Explicitly instructs returning a `SELECT 'Not available' AS note` query instead of silently approximating via proxy metrics (e.g. most `player_of_match` awards ≠ Player of the Series).
+
+**OUTPUT FORMAT instruction**
+Placed immediately before few-shot examples (highest influence position). Suppresses LLM chattiness (prose before/after SQL). `_clean_sql()` remains as a safety net but token waste is reduced.
+
+### Bugs fixed
+
+| # | Bug | Fix |
+|---|---|---|
+| #35 | "Player of the Series" silently approximated via `player_of_match` frequency | DATA LIMITATIONS block in system prompt |
+| #36 | "Currently playing" implies real-time squad data | HISTORICAL DATA block + Rule 5 in `rephrase_answer` prompt |
+| #37 | Empty result when LLM re-resolves player name via `players` table with wrong full name | PLAYER NAME RESOLUTION block in system prompt |

@@ -4,59 +4,6 @@ Chronological record of every bug, error, and issue encountered during developme
 
 ---
 
-## #36 — "Currently playing" phrasing implies real-time squad data the DB doesn't have
-
-**Symptom**
-Question: "in which team does sai sudarshan is playing currently"
-Answer: "Sai Sudarshan is **currently playing** for the Gujarat Titans."
-The word "currently" implies live squad knowledge the database does not have.
-
-**Root cause**
-The database contains historical IPL match data only. The SQL correctly uses the most recent `playing_xi` entry (ORDER BY year DESC, match_id DESC LIMIT 1), but `rephrase_answer` had no instruction to qualify temporal claims — so it echoed "currently" from the question as a present-tense fact.
-
-**Fix**
-Added Rule 5 to the `rephrase_answer` prompt in `agent.py`: never say "is currently playing" or "is their stat" — always qualify as "as of the most recent season in the database" or "most recently played for". Also added HISTORICAL DATA note to the SQL generation system prompt in `prompts.py`.
-
----
-
-## #37 — Empty result when LLM re-resolves known player via players table with wrong full name
-
-**Symptom**
-Q2: "What is Sai Sudarshan's batting average?" → correctly filtered `deliveries.batsman = 'B Sai Sudharsan'` → result 49.81.
-Q3: "What is his highest score in T20s?" → LLM tried `JOIN players p ON p.player_name = d.batsman WHERE p.player_full_name = 'Sai Sudarshan'` → empty result.
-
-**Root cause**
-Two compounding failures:
-1. Entity resolver didn't match "Sai Sudarshan" (partial/variant spelling) to the canonical short name 'B Sai Sudharsan', so no resolved name was injected.
-2. Without a resolved name, the LLM fell back to resolving via the `players` table, but used `player_full_name = 'Sai Sudarshan'` — an incomplete name that doesn't exist in the DB. The correct short name was already known from Q2 but the LLM didn't reuse it.
-
-**Fix**
-Added PLAYER NAME RESOLUTION rules to the SQL generation system prompt in `prompts.py`:
-- When a player's abbreviated short name is established in prior context, filter deliveries.batsman directly using it.
-- Only use the players table join when the short name is genuinely unknown.
-This prevents the LLM from re-resolving a name it already has, with a potentially wrong full-name form.
-
----
-
-## #35 — "Player of the Series" silently approximated using Player-of-the-Match frequency
-
-**Symptom**
-Question: "who was the player of the series in that season" (IPL 2023).
-Generated SQL approximated Player of the Series as the player with the most `player_of_match` awards in the season. Answer presented as fact with no disclaimer.
-
-**Root cause**
-The `matches` table has `player_of_match` (per-match award) but no `player_of_series` column. The LLM, finding no direct column, silently invented a proxy metric and returned it as if it were the official award. The system prompt had no DATA LIMITATIONS section telling the model what awards are and are not available, so it had no instruction to say "this data isn't stored."
-
-**Why it's dangerous**
-The answer happened to be plausible (Shubman Gill won Orange Cap 2023), but the logic is wrong. In other seasons the highest POM-count player ≠ official Player of the Series winner — the system would silently return the wrong answer with high confidence.
-
-**Fix**
-Added DATA LIMITATIONS section to the system prompt in `prompts.py`:
-- Explicitly lists which tournament-level awards are NOT stored (`player_of_series`, auction prices, etc.)
-- Instructs the LLM to return a descriptive SQL string ("data not available") instead of approximating
-- Separately documents which awards ARE available (`player_of_match`) and how to derive Orange/Purple Cap
-
----
 
 ## #1 — `npm ci` fails: no `package-lock.json`
 
@@ -1088,6 +1035,61 @@ mcp.run(transport="sse")
 
 ---
 
+## #35 — "Player of the Series" silently approximated using Player-of-the-Match frequency
+
+**Symptom**
+Question: "who was the player of the series in that season" (IPL 2023).
+Generated SQL approximated Player of the Series as the player with the most `player_of_match` awards in the season. Answer presented as fact with no disclaimer.
+
+**Root cause**
+The `matches` table has `player_of_match` (per-match award) but no `player_of_series` column. The LLM, finding no direct column, silently invented a proxy metric and returned it as if it were the official award. The system prompt had no DATA LIMITATIONS section telling the model what awards are and are not available, so it had no instruction to say "this data isn't stored."
+
+**Why it's dangerous**
+The answer happened to be plausible (Shubman Gill won Orange Cap 2023), but the logic is wrong. In other seasons the highest POM-count player ≠ official Player of the Series winner — the system would silently return the wrong answer with high confidence.
+
+**Fix**
+Added DATA LIMITATIONS section to the system prompt in `prompts.py`:
+- Explicitly lists which tournament-level awards are NOT stored (`player_of_series`, auction prices, etc.)
+- Instructs the LLM to return a descriptive SQL string ("data not available") instead of approximating
+- Separately documents which awards ARE available (`player_of_match`) and how to derive Orange/Purple Cap
+
+---
+
+## #36 — "Currently playing" phrasing implies real-time squad data the DB doesn't have
+
+**Symptom**
+Question: "in which team does sai sudarshan is playing currently"
+Answer: "Sai Sudarshan is **currently playing** for the Gujarat Titans."
+The word "currently" implies live squad knowledge the database does not have.
+
+**Root cause**
+The database contains historical IPL match data only. The SQL correctly uses the most recent `playing_xi` entry (ORDER BY year DESC, match_id DESC LIMIT 1), but `rephrase_answer` had no instruction to qualify temporal claims — so it echoed "currently" from the question as a present-tense fact.
+
+**Fix**
+Added Rule 5 to the `rephrase_answer` prompt in `agent.py`: never say "is currently playing" or "is their stat" — always qualify as "as of the most recent season in the database" or "most recently played for". Also added HISTORICAL DATA note to the SQL generation system prompt in `prompts.py`.
+
+---
+
+## #37 — Empty result when LLM re-resolves known player via players table with wrong full name
+
+**Symptom**
+Q2: "What is Sai Sudarshan's batting average?" → correctly filtered `deliveries.batsman = 'B Sai Sudharsan'` → result 49.81.
+Q3: "What is his highest score in T20s?" → LLM tried `JOIN players p ON p.player_name = d.batsman WHERE p.player_full_name = 'Sai Sudarshan'` → empty result.
+
+**Root cause**
+Two compounding failures:
+1. Entity resolver didn't match "Sai Sudarshan" (partial/variant spelling) to the canonical short name 'B Sai Sudharsan', so no resolved name was injected.
+2. Without a resolved name, the LLM fell back to resolving via the `players` table, but used `player_full_name = 'Sai Sudarshan'` — an incomplete name that doesn't exist in the DB. The correct short name was already known from Q2 but the LLM didn't reuse it.
+
+**Fix**
+Added PLAYER NAME RESOLUTION rules to the SQL generation system prompt in `prompts.py`:
+- When a player's abbreviated short name is established in prior context, filter deliveries.batsman directly using it.
+- Only use the players table join when the short name is genuinely unknown.
+This prevents the LLM from re-resolving a name it already has, with a potentially wrong full-name form.
+
+---
+
+
 ## Phase 10 — Redis Persistent History: No Bugs
 
 The Redis implementation (2026-03-16) was a clean feature addition with no bugs encountered during development.
@@ -1167,3 +1169,33 @@ Three production hardening features added (2026-03-16) with no bugs encountered.
 - `except LLMCircuitOpenError: raise` inside `_invoke()` prevents double-counting the failure when the open check inside an already-open call races
 - Circuit state is in-process (single replica). TODO: move to Redis for multi-replica consistency
 - `_circuit_record_success()` resets the counter on any successful call — the circuit goes half-open automatically (next call after cooldown is the probe; success resets, failure reopens)
+
+---
+
+## #38 — Redis URL misconfiguration in `.env` caused all Redis features to silently fall back to in-memory
+
+**Symptom**
+Backend logs on every startup:
+```
+Redis unavailable — rate limiter falling back to in-memory storage | error=Error -2 connecting to redis:6379. Name or service not known.
+```
+Response cache, conversation history, rate limiting, and follow-up chips all fell back to in-memory. Cache writes and reads never reached Redis. `KEYS "nl2sql:cache:*"` returned empty.
+
+**Root cause**
+Two `.env` misconfigurations compounded:
+1. `REDIS_URL=redis://localhost:6379/0` was active. Inside Docker, `localhost` resolves to the backend container's own loopback — not the Redis container. Docker DNS resolves the Redis service as `redis`, not `localhost`.
+2. `MCP_CHART_SERVER_URL` had two lines with the same key — `http://localhost:8087` (wrong) and `http://mcp_chart_server:8087` (correct Docker service name). python-dotenv takes the **first** value when a key appears twice, so the wrong localhost URL was silently active.
+
+`docker compose restart` does not re-read the `.env` file — only `docker compose up -d` recreates the container with updated env vars.
+
+**Fix**
+In `.env`:
+- Swapped comments: `REDIS_URL=redis://redis:6379/0` (active), `# REDIS_URL=redis://localhost:6379/0` (local dev comment)
+- Commented out the duplicate `MCP_CHART_SERVER_URL=http://localhost:8087`; kept only `http://mcp_chart_server:8087`
+
+Ran `docker compose up -d backend` (not `restart`) to recreate the container. Verified with:
+```
+Redis connected | url=redis://redis:6379/0 | ttl=86400s
+Rate limiter using Redis backend | url=redis://redis:6379/0 | limit=20/min
+Cache write | ttl=3600s
+```
