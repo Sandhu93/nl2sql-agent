@@ -82,7 +82,7 @@ def _build_llm_with_fallbacks() -> ChatOpenAI:
         4. Ollama            — local, no cost, quality depends on model size
     """
     primary = ChatOpenAI(
-        model="gpt-4o",
+        model=settings.openai_model,
         temperature=0,
         api_key=settings.openai_api_key,
     )
@@ -165,7 +165,8 @@ def _build_llm_with_fallbacks() -> ChatOpenAI:
 # TODO: Move to module-level once the environment is stable in production.
 # ---------------------------------------------------------------------------
 _db: SQLDatabase | None = None
-_llm: ChatOpenAI | None = None
+_llm: ChatOpenAI | None = None       # GPT-4o + fallbacks — SQL generation and SQL fixing only
+_fast_llm: ChatOpenAI | None = None  # GPT-4o-mini + GPT-4o fallback — all other LLM steps
 _generate_query = None
 _execute_query: QuerySQLDataBaseTool | None = None
 _rephrase_answer = None
@@ -449,7 +450,7 @@ async def _fix_sql(
 
 def _get_chain():
     """Return (generate_query, execute_query, rephrase_answer, select_table, rewrite_query), initialising them once."""
-    global _db, _llm, _generate_query, _execute_query, _rephrase_answer, _select_table, _rewrite_query
+    global _db, _llm, _fast_llm, _generate_query, _execute_query, _rephrase_answer, _select_table, _rewrite_query
 
     if _generate_query is not None:
         return _generate_query, _execute_query, _rephrase_answer, _select_table, _rewrite_query
@@ -476,10 +477,25 @@ def _get_chain():
                 _db.dialect, _db.get_usable_table_names())
 
     # --- LLM (primary + fallbacks) ---
-    # GPT-4o is primary. Any configured fallback providers are chained via
-    # .with_fallbacks() so the agent retries them automatically on API errors.
+    # _llm (GPT-4o): SQL generation and SQL fixing only — accuracy-critical.
+    # _fast_llm (GPT-4o-mini): query rewrite, table selection, answer rephrase,
+    #   insights, chart intent — lighter tasks where speed matters more than depth.
+    #   Falls back to GPT-4o if mini is unavailable.
     _llm = _build_llm_with_fallbacks()
     llm = _llm  # local alias for readability within this function
+
+    _fast_llm = ChatOpenAI(
+        model=settings.openai_fast_model,
+        temperature=0,
+        api_key=settings.openai_api_key,
+    ).with_fallbacks([
+        ChatOpenAI(model=settings.openai_model, temperature=0, api_key=settings.openai_api_key)
+    ])
+    fast_llm = _fast_llm  # local alias
+    logger.info(
+        "LLM routing | sql=%s | fast=%s",
+        settings.openai_model, settings.openai_fast_model,
+    )
 
     # --- Chain: natural language → SQL string (with few-shot examples) ---
     _generate_query = create_sql_query_chain(llm, _db, prompt=_build_few_shot_prompt())
@@ -503,7 +519,7 @@ SQL Query: {query}
 SQL Result: {result}
 Answer: """
     )
-    _rephrase_answer = answer_prompt | llm | StrOutputParser()
+    _rephrase_answer = answer_prompt | fast_llm | StrOutputParser()
 
     # --- Chain: question → List[str] of relevant table names ---
     # Reads plain-English table descriptions from the CSV and asks the LLM
@@ -528,7 +544,7 @@ Answer: """
                 ),
             ]
         )
-        | llm
+        | fast_llm
         | StrOutputParser()
         | (lambda raw: [t.strip() for t in raw.split(",") if t.strip()])
     )
@@ -563,7 +579,7 @@ Answer: """
             MessagesPlaceholder(variable_name="history"),
             ("human", "{question}"),
         ])
-        | llm
+        | fast_llm
         | StrOutputParser()
     )
 
@@ -846,7 +862,7 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
         """Run chart spec generation only when the question asks for a viz."""
         if not viz_requested:
             return None
-        return await generate_chart_spec(standalone_question, result, _llm)
+        return await generate_chart_spec(standalone_question, result, _fast_llm)
 
     # TODO: pass _llm_semaphore into generate_insights / generate_chart_spec if
     #       their LLM call volume becomes significant under heavier load.
@@ -856,7 +872,7 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
             "query": sql,
             "result": result,
         }),
-        generate_insights(standalone_question, result, _llm, recent_chips=recent_chips),
+        generate_insights(standalone_question, result, _fast_llm, recent_chips=recent_chips),
         _maybe_chart(),
     )
     logger.info("Rephrased answer: %s", answer)

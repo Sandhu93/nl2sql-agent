@@ -14,6 +14,19 @@ class Settings(BaseSettings):
     # OpenAI — primary LLM (required)
     openai_api_key: str = Field(..., description="OpenAI API key")
 
+    # Model routing — Phase 12 (latency optimisation)
+    # SQL generation and SQL fixing need full GPT-4o reasoning.
+    # Lighter tasks (query rewrite, table selection, answer rephrase, insights,
+    # chart intent) can use GPT-4o-mini: ~3-5× faster, ~15× cheaper.
+    openai_model: str = Field(
+        default="gpt-4o",
+        description="OpenAI model for SQL generation and SQL fixing (accuracy-critical)",
+    )
+    openai_fast_model: str = Field(
+        default="gpt-4o-mini",
+        description="OpenAI model for lightweight tasks: query rewrite, table selection, answer rephrase, insights",
+    )
+
     # Fallback LLM providers — all optional.
     # Add the API key for any provider you want to use as a fallback.
     # The backend will automatically include them in the fallback chain.
