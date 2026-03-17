@@ -513,6 +513,10 @@ RULES:
 2. Do NOT critique, analyse, or explain the SQL.
 3. Do NOT say the answer "cannot be determined" if data is present — use what the result gives you.
 4. If the result is a list of rows, present them clearly (e.g. as bullet points or a ranked list).
+5. TEMPORAL CAVEAT: This database contains historical IPL data only. Never say a player "is currently"
+   playing for a team, or that a stat "is" their current value. Instead say "as of the most recent
+   season in the database" or "most recently played for" or "based on available IPL data".
+   The database does not reflect squad changes, transfers, or retirements after the last recorded season.
 
 Question: {question}
 SQL Query: {query}
