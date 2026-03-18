@@ -5,7 +5,7 @@
 | **Product Name** | NL2SQL IPL Cricket Agent                   |
 | **Version**      | 2.0 (planned)                              |
 | **Status**       | Draft                                      |
-| **Last Updated** | 2026-03-16                                 |
+| **Last Updated** | 2026-03-19                                 |
 
 ---
 
@@ -17,10 +17,11 @@ using plain English. The system generates PostgreSQL queries from natural
 language, executes them safely, and returns human-readable answers alongside the
 generated SQL for transparency.
 
-**Current state (v1.1):** A working end-to-end pipeline with input validation,
+**Current state (v1.3):** A working end-to-end pipeline with input validation,
 query rewrite + entity resolution, few-shot SQL generation, semantic SQL
-guardrails, insight generation, optional visualization, and multi-provider LLM
-fallback.
+guardrails, insight generation, optional visualization, multi-provider LLM
+fallback, production hardening (semaphore, cache, circuit breaker), and
+ChromaDB disk persistence with content-hash cache invalidation (Phase 13).
 
 **Target state (v2):** An intelligent data analyst agent that goes beyond
 question-answering to deliver insights, on-demand visualizations, and
@@ -224,7 +225,7 @@ History updated (original question + answer stored to Redis, TTL 24h)
 | LLM orchestration  | LangChain                                            |
 | Primary LLM        | OpenAI GPT-4o                                        |
 | Fallback LLMs      | Anthropic Claude, Google Gemini, DeepSeek, Ollama    |
-| Embeddings         | OpenAI text-embedding-ada-002 via ChromaDB           |
+| Embeddings         | OpenAI embeddings via ChromaDB (persistent to `/app/chroma_data`; SHA-256 content-hash + model-name invalidation) |
 | Database           | PostgreSQL + psycopg2                                |
 | Frontend           | Next.js 14, TypeScript, Tailwind CSS                 |
 | Session storage    | Redis 7 Alpine (`RedisChatMessageHistory`, chips JSON)|
@@ -587,6 +588,9 @@ class QueryResponse(BaseModel):
 | NFR-10| Audit logging for blocked queries       | WARNING level                     |
 | NFR-11| Insight/viz failure is non-fatal        | Base answer always returned       |
 | NFR-12| Report section cap                      | Max 8 sections per report         |
+| NFR-13| Embedding versioning                    | Re-embed on model name change; hash includes model ID |
+| NFR-14| Schema drift detection                  | Warn on startup if DB schema differs from stored fingerprint |
+| NFR-15| Retrieval evaluation                    | Smoke-test suite: k=3 RAG must return expected section for golden Q&A pairs |
 
 ---
 
@@ -618,14 +622,16 @@ class QueryResponse(BaseModel):
 | Phase 9.5 | Visualization migration to MCP chart server        | ✅ Done   |
 | Phase 10 | Redis persistent history + per-IP rate limiting     | ✅ Done   |
 | Phase 11 | Semaphore + response cache + circuit breaker        | ✅ Done   |
+| Phase 13 | ChromaDB disk persistence + entity resolver TTL refresh | ✅ Done |
 
 ### Planned Phases
 
 | Phase    | Scope                                               | Dependencies     | Estimated Effort |
 |----------|-----------------------------------------------------|------------------|------------------|
 | Phase 12 | Multi-modal report agent                            | Phase 8 + 9.5    | Large            |
-| Phase 13 | Streaming responses (SSE/NDJSON)                    | None             | Medium           |
-| Phase 14 | Authentication + multi-user                         | None             | Medium           |
+| Phase 14 | Data Pipeline & Observability (embedding versioning, schema drift detection, retrieval eval) | Phase 13 | Small–Medium |
+| Phase 15 | Streaming responses (SSE/NDJSON)                    | None             | Medium           |
+| Phase 16 | Authentication + multi-user                         | None             | Medium           |
 
 ### Phase Dependency Graph
 
@@ -643,8 +649,12 @@ Phase 8 (Insights)
                           ▼
                      uses MCP chart server from Phase 9.5
 
-Phase 11 (Streaming) ──── independent, can run in parallel
-Phase 12 (Auth)      ──── independent, can run in parallel
+Phase 13 (ChromaDB persistence + entity resolver TTL) ──── ✅ Done
+
+Phase 14 (Embedding versioning + schema drift + retrieval eval) ──── depends on Phase 13
+
+Phase 15 (Streaming) ──── independent, can run in parallel
+Phase 16 (Auth)      ──── independent, can run in parallel
 ```
 
 ---

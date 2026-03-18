@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from collections import defaultdict
 
 import psycopg2
@@ -26,6 +27,45 @@ settings = get_settings()
 _FULL_TO_SHORT: dict[str, str] | None = None
 _SHORT_NAMES: set[str] | None = None
 _SURNAME_INITIAL_TO_SHORT: dict[tuple[str, str], list[str]] | None = None
+# Monotonic timestamp of the last successful index load.
+# None means the index has never been loaded (or was explicitly reset).
+_INDEX_LOADED_AT: float | None = None
+
+
+def _is_index_stale() -> bool:
+    """
+    Return True when the index has never been loaded or the TTL has expired.
+
+    Uses monotonic time so the comparison is unaffected by wall-clock changes
+    (e.g. DST or NTP adjustments).  TTL is controlled by
+    settings.player_index_ttl_seconds (default 3600 s / 1 hour).
+    """
+    if _INDEX_LOADED_AT is None:
+        return True
+    return (time.monotonic() - _INDEX_LOADED_AT) > settings.player_index_ttl_seconds
+
+
+def refresh_player_index() -> None:
+    """
+    Force an immediate reload of the player name index from the database.
+
+    Use this after inserting new players into the players table mid-season,
+    or to recover from a failed initial load (e.g. DB unreachable at startup).
+
+    The index globals are reset to None before the reload so that a concurrent
+    request will wait for the new load rather than reading stale data.
+
+    TODO: This is not concurrency-safe under multiple uvicorn workers sharing
+          the same process space (threaded workers).  For multi-worker safety,
+          add a threading.Lock around the reset+reload block.
+    """
+    global _FULL_TO_SHORT, _SHORT_NAMES, _SURNAME_INITIAL_TO_SHORT, _INDEX_LOADED_AT
+    _FULL_TO_SHORT = None
+    _SHORT_NAMES = None
+    _SURNAME_INITIAL_TO_SHORT = None
+    _INDEX_LOADED_AT = None
+    logger.info("Player resolver index refresh triggered")
+    _load_player_index()
 
 
 def _norm(text: str) -> str:
@@ -35,9 +75,17 @@ def _norm(text: str) -> str:
 
 
 def _load_player_index() -> None:
-    """Load players name index from DB once and cache in module globals."""
-    global _FULL_TO_SHORT, _SHORT_NAMES, _SURNAME_INITIAL_TO_SHORT
-    if _FULL_TO_SHORT is not None:
+    """
+    Load (or refresh) the player name index from the DB and cache in module globals.
+
+    Skips the load when the index is already populated AND has not exceeded its
+    TTL (settings.player_index_ttl_seconds).  This means:
+      - First call: always loads.
+      - Subsequent calls within TTL: returns immediately (free).
+      - Subsequent calls after TTL: silently reloads from DB.
+    """
+    global _FULL_TO_SHORT, _SHORT_NAMES, _SURNAME_INITIAL_TO_SHORT, _INDEX_LOADED_AT
+    if _FULL_TO_SHORT is not None and not _is_index_stale():
         return
 
     full_to_short: dict[str, str] = {}
@@ -84,16 +132,19 @@ def _load_player_index() -> None:
         _FULL_TO_SHORT = full_to_short
         _SHORT_NAMES = short_names
         _SURNAME_INITIAL_TO_SHORT = surname_initial_to_short
+        _INDEX_LOADED_AT = time.monotonic()
         logger.info(
-            "Player resolver index loaded | players=%d | full_names=%d",
+            "Player resolver index loaded | players=%d | full_names=%d | ttl=%ds",
             len(rows),
             len(_FULL_TO_SHORT),
+            settings.player_index_ttl_seconds,
         )
     except Exception as exc:
         logger.warning("Player resolver index load failed (non-blocking): %s", exc)
         _FULL_TO_SHORT = {}
         _SHORT_NAMES = set()
         _SURNAME_INITIAL_TO_SHORT = {}
+        # Do not update _INDEX_LOADED_AT on failure so the next call retries.
 
 
 def resolve_player_mentions(question: str) -> tuple[str, dict[str, str]]:

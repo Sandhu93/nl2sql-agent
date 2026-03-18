@@ -9,7 +9,11 @@ _build_few_shot_prompt()  — assembles the full ChatPromptTemplate used by
                 SemanticSimilarityExampleSelector + ChromaDB.
 """
 
+import hashlib
+import json
 import logging
+import shutil
+from pathlib import Path
 
 from langchain_community.vectorstores import Chroma
 from langchain_core.example_selectors import SemanticSimilarityExampleSelector
@@ -484,6 +488,84 @@ IPL_EXAMPLES = [
 ]
 
 
+def _get_few_shot_selector(
+    embeddings: OpenAIEmbeddings,
+) -> SemanticSimilarityExampleSelector:
+    """
+    Return a SemanticSimilarityExampleSelector backed by a persistent ChromaDB.
+
+    On first call (or when IPL_EXAMPLES has changed) the 15 examples are
+    embedded and saved to settings.chroma_persist_dir/few_shot.  Subsequent
+    cold starts load from disk — no OpenAI embeddings call required.
+
+    Change detection: a SHA-256 hash of the serialised IPL_EXAMPLES list is
+    written to .examples_hash alongside the ChromaDB files.  If the hash
+    differs (examples were added/edited), the old store is deleted and rebuilt.
+
+    TODO: Add a file-lock for multi-worker safety if uvicorn is run with
+          multiple worker processes sharing the same chroma_persist_dir.
+    """
+    _HASH_FILE_NAME = ".examples_hash"
+    persist_dir = Path(settings.chroma_persist_dir) / "few_shot"
+    persist_dir.mkdir(parents=True, exist_ok=True)
+
+    # Stable hash of the full IPL_EXAMPLES list.
+    examples_hash = hashlib.sha256(
+        json.dumps(IPL_EXAMPLES, sort_keys=True).encode()
+    ).hexdigest()
+    hash_file = persist_dir / _HASH_FILE_NAME
+
+    has_data = any(f.name != _HASH_FILE_NAME for f in persist_dir.iterdir())
+    cache_valid = (
+        has_data
+        and hash_file.exists()
+        and hash_file.read_text().strip() == examples_hash
+    )
+
+    if cache_valid:
+        # Fast path: load existing store, skip embedding API call.
+        vectorstore = Chroma(
+            collection_name="ipl_few_shot",
+            embedding_function=embeddings,
+            persist_directory=str(persist_dir),
+        )
+        logger.info("Few-shot selector loaded from disk | dir=%s", persist_dir)
+        # Provide IPL_EXAMPLES so the selector's .examples attribute is populated;
+        # select_examples() uses metadata from the vectorstore search results, not
+        # this list directly, but the attribute is part of the public interface.
+        return SemanticSimilarityExampleSelector(
+            vectorstore=vectorstore,
+            examples=IPL_EXAMPLES,
+            k=3,
+            input_keys=["input"],
+        )
+
+    # Slow path: (re-)embed and persist.  Clear any stale data first.
+    if persist_dir.exists():
+        shutil.rmtree(persist_dir)
+    persist_dir.mkdir(parents=True, exist_ok=True)
+
+    # from_examples() calls Chroma.from_texts() with each example's input text
+    # as the embedding source and the full example dict as metadata, so
+    # select_examples() can reconstruct both "input" and "query" from the hit.
+    selector = SemanticSimilarityExampleSelector.from_examples(
+        IPL_EXAMPLES,
+        embeddings,
+        Chroma,
+        k=3,
+        input_keys=["input"],
+        persist_directory=str(persist_dir),
+        collection_name="ipl_few_shot",
+    )
+    hash_file.write_text(examples_hash)
+    logger.info(
+        "Few-shot selector built and persisted | dir=%s | examples=%d",
+        persist_dir,
+        len(IPL_EXAMPLES),
+    )
+    return selector
+
+
 def _build_few_shot_prompt() -> ChatPromptTemplate:
     """
     Assemble a ChatPromptTemplate with DYNAMIC few-shot example selection.
@@ -511,19 +593,14 @@ def _build_few_shot_prompt() -> ChatPromptTemplate:
         ]
     )
 
-    # Embed all IPL_EXAMPLES into an in-memory Chroma vector store.
+    # Build (or load from disk) the few-shot example selector.
     # At query time the selector computes cosine similarity between the
     # incoming question embedding and each stored example, then returns the
-    # k closest matches.  The vector store is rebuilt fresh each startup
-    # (no persistence needed for this small example set).
-    example_selector = SemanticSimilarityExampleSelector.from_examples(
-        IPL_EXAMPLES,
-        OpenAIEmbeddings(api_key=settings.openai_api_key),
-        Chroma,
-        k=3,
-        input_keys=["input"],
-    )
-    logger.info("Dynamic example selector built | examples=%d | k=3", len(IPL_EXAMPLES))
+    # k=3 closest matches.  The vector store is persisted so embeddings are
+    # not recomputed on every cold start.
+    embeddings = OpenAIEmbeddings(api_key=settings.openai_api_key)
+    example_selector = _get_few_shot_selector(embeddings)
+    logger.info("Dynamic example selector ready | examples=%d | k=3", len(IPL_EXAMPLES))
 
     # Dynamic few-shot block: examples are chosen at call-time via the selector
     few_shot_prompt = FewShotChatMessagePromptTemplate(

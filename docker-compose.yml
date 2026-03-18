@@ -17,7 +17,8 @@ networks:
     driver: bridge
 
 volumes:
-  redis_data:   # persists RDB snapshots across container restarts
+  redis_data:    # persists RDB snapshots across container restarts
+  chroma_data:   # persists ChromaDB vector stores (cricket rules RAG + few-shot examples) — Phase 13
 
 services:
   # --------------------------------------------------------------------------
@@ -98,6 +99,13 @@ services:
     volumes:
       # Hot-reload: mount source code so uvicorn --reload picks up changes.
       - ./backend/app:/app/app
+      # Persistent ChromaDB vector stores — Phase 13.
+      # Survives container restarts so embeddings are not recomputed on every
+      # cold start.  To force a full re-embed, run:
+      #   docker compose down -v   (removes ALL volumes — also wipes Redis)
+      # or delete only the chroma_data volume:
+      #   docker volume rm nl2sql_agent_chroma_data
+      - chroma_data:/app/chroma_data
     networks:
       - app_net
     depends_on:

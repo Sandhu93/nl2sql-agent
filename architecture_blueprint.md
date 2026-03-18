@@ -63,8 +63,8 @@ Draw box 9 to the side of box 8 with a looping arrow.
 
 | Box | Label | Notes |
 |---|---|---|
-| ChromaDB — Few-shot | `ChromaDB` / `Few-Shot Examples` | 17 IPL examples, k=3 similarity |
-| ChromaDB — Cricket Rules | `ChromaDB` / `Cricket Rules` | cricket_rules.md, k=3 similarity |
+| ChromaDB — Few-shot | `ChromaDB` / `Few-Shot Examples` | 17 IPL examples, k=3 similarity; persistent to `/app/chroma_data/few_shot`; SHA-256 hash invalidation |
+| ChromaDB — Cricket Rules | `ChromaDB` / `Cricket Rules` | cricket_rules.md, k=3 similarity; persistent to `/app/chroma_data/cricket_rules`; SHA-256 hash invalidation |
 
 ---
 
@@ -74,6 +74,7 @@ Draw box 9 to the side of box 8 with a looping arrow.
 |---|---|---|
 | PostgreSQL | `PostgreSQL` / `ipl_db` | cylinder/database icon, 9 tables |
 | Redis | `Redis 7 Alpine` | session history + chips (TTL 24h) + rate limit counters + response cache |
+| Schema Watcher | `schema_watcher.py` | (Phase 14, planned) startup check — hashes `information_schema.columns`; logs WARNING on drift |
 | MCP Chart Server | `MCP Chart Server` / `port 8087` | deterministic Vega-Lite spec generation |
 | LLM Primary | `GPT-4o` | primary LLM |
 | LLM Fallbacks | `Claude / Gemini 2.0 Flash / DeepSeek / Ollama` | fallback chain |
@@ -147,7 +148,7 @@ Draw box 9 to the side of box 8 with a looping arrow.
 ## Title
 
 At the top: **NL2SQL Agent — System Architecture**
-Sub-title: `IPL Cricket Database · FastAPI + Next.js · GPT-4o + ChromaDB + PostgreSQL`
+Sub-title: `IPL Cricket Database · FastAPI + Next.js · GPT-4o + ChromaDB (persistent) + PostgreSQL + Redis`
 
 ---
 
@@ -298,8 +299,8 @@ flowchart LR
 
     subgraph KS["Knowledge Stores — ChromaDB"]
         direction TB
-        ChromaFS["Few-Shot Examples\n17 IPL patterns · k=3 similarity"]
-        ChromaCR["Cricket Rules\ncricket_rules.md · 26 §§ · k=3 similarity"]
+        ChromaFS["Few-Shot Examples\n17 IPL patterns · k=3 similarity\npersistent /app/chroma_data/few_shot"]
+        ChromaCR["Cricket Rules\ncricket_rules.md · 26 §§ · k=3 similarity\npersistent /app/chroma_data/cricket_rules"]
     end
 
     subgraph EXT["External Services"]

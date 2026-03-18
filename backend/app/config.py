@@ -105,6 +105,27 @@ class Settings(BaseSettings):
         description="TTL (seconds) for Redis session keys (history + chips)",
     )
 
+    # ChromaDB persistence — Phase 13
+    # Persistent vector stores for cricket rules RAG and few-shot examples.
+    # Docker default: /app/chroma_data (mounted as a named volume in docker-compose).
+    # Local dev override: CHROMA_PERSIST_DIR=./chroma_data
+    # To force a full re-embed (e.g. after upgrading chromadb): delete this directory
+    # and restart. The content-hash guard will detect the missing store and rebuild.
+    chroma_persist_dir: str = Field(
+        default="/app/chroma_data",
+        description="Root directory for ChromaDB persistent vector stores",
+    )
+
+    # Player name index TTL — Phase 13
+    # The entity resolver loads the players table once and caches it in memory.
+    # After this many seconds the cache is considered stale and the next request
+    # triggers a silent background refresh from the DB. Prevents restarts being
+    # required when new players are added to the players table mid-season.
+    player_index_ttl_seconds: int = Field(
+        default=3600,  # 1 hour
+        description="TTL (seconds) for the in-memory player name index",
+    )
+
     # CORS
     allowed_origins: list[str] = Field(
         default=["http://localhost:8085"],

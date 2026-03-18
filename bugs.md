@@ -1199,3 +1199,59 @@ Redis connected | url=redis://redis:6379/0 | ttl=86400s
 Rate limiter using Redis backend | url=redis://redis:6379/0 | limit=20/min
 Cache write | ttl=3600s
 ```
+
+---
+
+## Phase 13 — ChromaDB Disk Persistence + Entity Resolver TTL
+
+### Fix 1: ChromaDB in-memory only — vector stores rebuilt on every cold start
+
+**Symptom**
+Every container restart re-embedded `cricket_rules.md` (~26 sections) and all 15
+`IPL_EXAMPLES` via the OpenAI embeddings API.  This added 3–6 seconds to cold-start
+latency, consumed OpenAI API credits unnecessarily, and meant embeddings were
+lost each time the backend container restarted.
+
+**Root cause**
+Both `cricket_knowledge.py` and `prompts.py` passed no `persist_directory` to
+`Chroma` / `SemanticSimilarityExampleSelector.from_examples()`, so ChromaDB kept
+all vectors in memory only.
+
+**Fix**
+- `config.py` — added `chroma_persist_dir` (default `/app/chroma_data`).
+- `cricket_knowledge.py` — `_get_vectorstore()` now checks `chroma_persist_dir/cricket_rules`.
+  Content-hash guard (SHA-256 of `cricket_rules.md`) detects changes; on match → load
+  from disk; on mismatch → wipe + re-embed + write new hash.
+- `prompts.py` — new `_get_few_shot_selector()` helper applies the same pattern to
+  `chroma_persist_dir/few_shot` (hash of serialised `IPL_EXAMPLES`).
+- `docker-compose.yml` — added `chroma_data` named volume mounted at `/app/chroma_data`
+  in the backend service so the store survives `docker compose up --build`.
+- `.env.example` — documented `CHROMA_PERSIST_DIR` override for local dev.
+
+**Result**
+Cold starts that previously required two embedding API round-trips now load from
+disk in milliseconds.  Re-embedding only occurs when `cricket_rules.md` or
+`IPL_EXAMPLES` actually change.
+
+---
+
+### Fix 2: Entity resolver has no refresh mechanism
+
+**Symptom**
+`entity_resolver.py` loaded the players table once (lazy singleton) and cached it
+forever.  If a new player was inserted into the `players` table mid-season — e.g.
+after an IPL auction — the resolver would return stale data for the entire lifetime
+of the container.  The only way to pick up changes was a full backend restart.
+
+**Root cause**
+`_load_player_index()` used `if _FULL_TO_SHORT is not None: return` with no
+expiry check and no public refresh API.
+
+**Fix**
+- `entity_resolver.py` — added `_INDEX_LOADED_AT: float | None` (monotonic
+  timestamp), `_is_index_stale()` (compares against `settings.player_index_ttl_seconds`,
+  default 3600 s), and `refresh_player_index()` (resets globals + reloads).
+- `_load_player_index()` now re-enters the DB load when the index is stale.
+- Load failure leaves `_INDEX_LOADED_AT = None` so the next request retries.
+- `config.py` — added `player_index_ttl_seconds` (default 3600).
+- `.env.example` — documented `PLAYER_INDEX_TTL_SECONDS` override.
