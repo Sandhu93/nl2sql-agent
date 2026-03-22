@@ -4,6 +4,27 @@ Chronological record of every bug, error, and issue encountered during developme
 
 ---
 
+## #66 — Circuit breaker state lost on restart and not shared across replicas
+
+**Symptom**
+After a backend restart, `_circuit_failures` and `_circuit_open_until` reset to 0 / 0.0, erasing all accumulated failure history. With multiple backend replicas, each replica maintains independent circuit state — one replica's LLM failures don't open the circuit on others.
+
+**Root cause**
+Circuit breaker state was stored in module-level Python variables (`_circuit_failures: int`, `_circuit_open_until: float`). These are in-process only — lost on every restart and invisible to sibling replicas.
+
+**Fix**
+Migrated to Redis-backed state (Phase 17) in `agent.py`:
+- `INCR nl2sql:circuit:failures` — atomic counter, persists across restarts
+- `SET nl2sql:circuit:open 1 EX <cooldown>` — presence flag with TTL; auto-expires for half-open
+- `EXISTS nl2sql:circuit:open` — open check
+- `getdel nl2sql:circuit:failures` + `delete nl2sql:circuit:open` — success reset
+
+Fallback: if Redis is unreachable the in-process variables are used instead (same graceful degradation as history + cache). Also fixed a latent bug in the fallback path where `_circuit_record_success()` did not reset `_circuit_open_until = 0.0`, leaving the circuit stuck "open" until cooldown expired even after a successful half-open call.
+
+Updated `test_agent_circuit_breaker.py`: fixture forces `_redis_available = False` for in-process tests; added 11 new Redis-path tests covering all four Redis operations and fallback on Redis error.
+
+---
+
 ## #65 — Venue name exact match fails due to city suffix in database
 
 **Symptom**

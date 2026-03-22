@@ -276,7 +276,7 @@ def _set_recent_chips(thread_id: str, chips: list[str]) -> None:
 _llm_semaphore: asyncio.Semaphore | None = None
 
 # ---------------------------------------------------------------------------
-# Circuit breaker — Phase 11 (production hardening)
+# Circuit breaker — Phase 11 (production hardening) / Redis-backed (Phase 17)
 #
 # Tracks consecutive LLM chain failures (primary + all fallbacks exhausted).
 # After FAILURE_THRESHOLD failures in a row the circuit "opens" and all LLM
@@ -288,33 +288,76 @@ _llm_semaphore: asyncio.Semaphore | None = None
 # Configured via settings.llm_circuit_failure_threshold /
 # settings.llm_circuit_cooldown_seconds (see config.py + .env.example).
 #
-# State is in-process (single replica).
-# TODO: move _circuit_failures and _circuit_open_until to Redis so multiple
-#       backend replicas share a consistent view of provider health.
+# State is stored in Redis so multiple backend replicas share a consistent
+# view of provider health:
+#   nl2sql:circuit:failures  — INCR counter (integer, no TTL)
+#   nl2sql:circuit:open      — presence flag, TTL = cooldown_seconds (auto-expires)
+#
+# Fallback: if Redis is unavailable the in-process variables below are used
+# instead, giving the same single-replica behaviour as Phase 11.
 # ---------------------------------------------------------------------------
+
+_CIRCUIT_FAILURES_KEY = "nl2sql:circuit:failures"
+_CIRCUIT_OPEN_KEY = "nl2sql:circuit:open"
 
 
 class LLMCircuitOpenError(RuntimeError):
     """Raised by _llm_invoke when the circuit breaker is open."""
 
 
+# In-process fallback state (used only when Redis is unreachable)
 _circuit_failures: int = 0
 _circuit_open_until: float = 0.0
 
 
 def _is_circuit_open() -> bool:
+    if _redis_available and _redis_client:
+        try:
+            return bool(_redis_client.exists(_CIRCUIT_OPEN_KEY))
+        except Exception:
+            pass
     return time.time() < _circuit_open_until
 
 
 def _circuit_record_success() -> None:
-    global _circuit_failures
+    global _circuit_failures, _circuit_open_until
+    if _redis_available and _redis_client:
+        try:
+            prev = _redis_client.getdel(_CIRCUIT_FAILURES_KEY)
+            if prev and int(prev) > 0:
+                logger.info("LLM circuit breaker reset | had %s consecutive failure(s)", prev.decode())
+            _redis_client.delete(_CIRCUIT_OPEN_KEY)
+            return
+        except Exception:
+            pass
+    # Fallback: in-process
     if _circuit_failures > 0:
         logger.info("LLM circuit breaker reset | had %d consecutive failure(s)", _circuit_failures)
     _circuit_failures = 0
+    _circuit_open_until = 0.0
 
 
 def _circuit_record_failure() -> None:
     global _circuit_failures, _circuit_open_until
+    if _redis_available and _redis_client:
+        try:
+            failures = _redis_client.incr(_CIRCUIT_FAILURES_KEY)
+            logger.warning(
+                "LLM call failed | consecutive_failures=%d | threshold=%d",
+                failures,
+                settings.llm_circuit_failure_threshold,
+            )
+            if failures >= settings.llm_circuit_failure_threshold:
+                _redis_client.set(_CIRCUIT_OPEN_KEY, 1, ex=settings.llm_circuit_cooldown_seconds)
+                logger.error(
+                    "LLM circuit breaker OPENED | consecutive_failures=%d | cooldown=%ds",
+                    failures,
+                    settings.llm_circuit_cooldown_seconds,
+                )
+            return
+        except Exception:
+            pass
+    # Fallback: in-process
     _circuit_failures += 1
     logger.warning(
         "LLM call failed | consecutive_failures=%d | threshold=%d",
