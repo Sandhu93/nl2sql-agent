@@ -161,9 +161,9 @@ export default function ChatPage() {
       {/* Header */}
       <header className="py-6 border-b border-gray-800 flex-shrink-0 flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight">NL2SQL Agent</h1>
+          <h1 className="text-2xl font-semibold tracking-tight">IPL Cricket Analyst</h1>
           <p className="text-sm text-gray-400 mt-1">
-            Ask questions in plain English — get answers powered by SQL.
+            Ask anything about IPL data — get SQL-backed answers, insights, and charts in real time.
           </p>
         </div>
         <button
