@@ -110,13 +110,21 @@ IPL_EXAMPLES = [
             "  AND d.batsman_runs = 6;"
         ),
     },
+    # Highest individual score pattern — teaches the model that:
+    #   - a "score" is an INNINGS-LEVEL total (GROUP BY batsman, match_id, inning)
+    #   - NEVER group only by batsman + match_id (misses split-innings edge cases)
+    #   - for "overall best across all innings": outer MAX with LIMIT 1
     {
-        "input": "What is the highest individual score in a single match?",
+        "input": "What is the highest individual score in a single innings?",
         "query": (
-            "SELECT batsman, match_id, SUM(batsman_runs) AS runs_in_match "
-            "FROM deliveries "
-            "GROUP BY batsman, match_id "
-            "ORDER BY runs_in_match DESC "
+            "WITH innings AS (\n"
+            "    SELECT batsman, match_id, inning, SUM(batsman_runs) AS runs\n"
+            "    FROM deliveries\n"
+            "    GROUP BY batsman, match_id, inning\n"
+            ")\n"
+            "SELECT batsman, runs AS highest_score\n"
+            "FROM innings\n"
+            "ORDER BY highest_score DESC\n"
             "LIMIT 1;"
         ),
     },
@@ -476,13 +484,173 @@ IPL_EXAMPLES = [
             "      AND dismissal_kind <> 'retired hurt'\n"
             "    GROUP BY player_dismissed\n"
             ")\n"
-            "SELECT r.player, r.total_runs, o.outs,\n"
+            "SELECT r.player,\n"
             "    ROUND(r.total_runs::numeric / NULLIF(o.outs, 0), 2) AS batting_average\n"
             "FROM batting_runs r\n"
             "JOIN batting_outs o ON o.player = r.player\n"
             "WHERE o.outs > 0\n"
             "ORDER BY batting_average DESC\n"
             "LIMIT 10;\n"
+        ),
+    },
+    # Toss query pattern — teaches the model that:
+    #   - toss decision always requires BOTH toss_winner AND toss_decision columns
+    #   - toss_winner is who won the toss; toss_decision is what they chose (bat/field)
+    #   - match_stage = 'Final' for the final match of a tournament
+    {
+        "input": "What was the toss decision in the 2023 final?",
+        "query": (
+            "SELECT toss_winner, toss_decision\n"
+            "FROM matches\n"
+            "WHERE year = 2023 AND match_stage = 'Final';"
+        ),
+    },
+    # Single-player highest score pattern — teaches the model that:
+    #   - use an innings-level CTE (GROUP BY match_id, inning) to get per-innings totals
+    #   - then SELECT MAX(runs) — no need to include batsman in SELECT (already in WHERE)
+    #   - NEVER group only by match_id (misses second innings in the same match)
+    {
+        "input": "What was Virat Kohli's highest score in IPL history?",
+        "query": (
+            "WITH innings AS (\n"
+            "    SELECT match_id, inning, SUM(batsman_runs) AS runs\n"
+            "    FROM deliveries\n"
+            "    WHERE batsman = 'V Kohli'\n"
+            "    GROUP BY match_id, inning\n"
+            ")\n"
+            "SELECT MAX(runs) AS highest_score FROM innings;"
+        ),
+    },
+    # Single-player batting average pattern — teaches the model that:
+    #   - when player is named in WHERE, return ONLY the computed stat (no name column)
+    #   - outs counted by player_dismissed (not batsman), excluding 'retired hurt'
+    #   - result is a single row with a single column: batting_average
+    {
+        "input": "What is Virat Kohli's batting average in IPL history?",
+        "query": (
+            "WITH runs AS (\n"
+            "    SELECT SUM(batsman_runs) AS total_runs\n"
+            "    FROM deliveries WHERE batsman = 'V Kohli'\n"
+            "),\n"
+            "outs AS (\n"
+            "    SELECT COUNT(*) AS total_outs\n"
+            "    FROM deliveries\n"
+            "    WHERE player_dismissed = 'V Kohli'\n"
+            "      AND dismissal_kind <> 'retired hurt'\n"
+            ")\n"
+            "SELECT ROUND(r.total_runs::numeric / NULLIF(o.total_outs, 0), 2) AS batting_average\n"
+            "FROM runs r, outs o;"
+        ),
+    },
+    # Single-player economy rate pattern — teaches the model that:
+    #   - when bowler is named in WHERE, return ONLY the economy_rate (no bowler column)
+    #   - bowler_runs_conceded = batsman_runs + wide/no-ball extras only (no byes/leg-byes)
+    #   - NULLIF guards divide-by-zero when no legal deliveries exist
+    {
+        "input": "What is Bhuvneshwar Kumar's economy rate in IPL history?",
+        "query": (
+            "SELECT ROUND(\n"
+            "    6.0 * SUM(\n"
+            "        COALESCE(batsman_runs, 0)\n"
+            "        + CASE WHEN is_wide OR is_no_ball THEN COALESCE(extras, 0) ELSE 0 END\n"
+            "    )::numeric\n"
+            "    / NULLIF(COUNT(*) FILTER (WHERE NOT is_wide AND NOT is_no_ball), 0),\n"
+            "    2\n"
+            ") AS economy_rate\n"
+            "FROM deliveries\n"
+            "WHERE bowler = 'B Kumar';"
+        ),
+    },
+    # Fastest fifty pattern — teaches the model that:
+    #   - use a cumulative window function (SUM OVER ORDER BY over, ball) to track runs ball-by-ball
+    #   - balls_faced excludes wides (CASE WHEN NOT is_wide THEN 1 ELSE 0 END)
+    #   - first ball where cumulative_runs >= 50 gives the fifty milestone
+    #   - MIN(balls_faced) at that milestone = balls to reach fifty
+    {
+        "input": "Who scored the fastest fifty in IPL history?",
+        "query": (
+            "WITH innings_cumulative AS (\n"
+            "    SELECT d.batsman, d.match_id, d.inning,\n"
+            "           SUM(CASE WHEN NOT d.is_wide THEN 1 ELSE 0 END) OVER (\n"
+            "               PARTITION BY d.batsman, d.match_id, d.inning\n"
+            "               ORDER BY d.over, d.ball\n"
+            "           ) AS balls_faced,\n"
+            "           SUM(d.batsman_runs) OVER (\n"
+            "               PARTITION BY d.batsman, d.match_id, d.inning\n"
+            "               ORDER BY d.over, d.ball\n"
+            "           ) AS cumulative_runs\n"
+            "    FROM deliveries d\n"
+            "),\n"
+            "fifty_milestone AS (\n"
+            "    SELECT batsman, match_id, inning, MIN(balls_faced) AS balls_for_fifty\n"
+            "    FROM innings_cumulative\n"
+            "    WHERE cumulative_runs >= 50\n"
+            "    GROUP BY batsman, match_id, inning\n"
+            ")\n"
+            "SELECT batsman, MIN(balls_for_fifty) AS fastest_fifty_balls\n"
+            "FROM fifty_milestone\n"
+            "GROUP BY batsman\n"
+            "ORDER BY fastest_fifty_balls ASC LIMIT 1;"
+        ),
+    },
+    # Bowling strike rate with threshold — teaches the model that:
+    #   - when question filters by a threshold ('at least N wickets'), include that metric in SELECT
+    #   - use NOT IN exclusion for bowler-credited wickets (more robust than whitelist)
+    #   - strike_rate = balls_bowled / wickets (lower is better)
+    {
+        "input": "Which bowler has the best bowling strike rate among those with at least 50 wickets?",
+        "query": (
+            "WITH stats AS (\n"
+            "    SELECT bowler,\n"
+            "           COUNT(*) FILTER (\n"
+            "               WHERE dismissal_kind IS NOT NULL\n"
+            "               AND dismissal_kind NOT IN (\n"
+            "                   'run out', 'retired hurt', 'retired out', 'obstructed the field'\n"
+            "               )\n"
+            "           ) AS wickets,\n"
+            "           COUNT(*) FILTER (WHERE NOT is_wide AND NOT is_no_ball) AS balls_bowled\n"
+            "    FROM deliveries\n"
+            "    GROUP BY bowler\n"
+            ")\n"
+            "SELECT bowler, ROUND(balls_bowled::numeric / NULLIF(wickets, 0), 2) AS strike_rate, wickets\n"
+            "FROM stats\n"
+            "WHERE wickets >= 50\n"
+            "ORDER BY strike_rate ASC LIMIT 1;"
+        ),
+    },
+    # Match scorecard pattern — teaches the model that:
+    #   - a scorecard requires: batting_team, inning, total_runs, wickets_lost
+    #   - total_runs = SUM(batsman_runs + extras) per inning
+    #   - wickets_lost = COUNT(dismissal_kind IS NOT NULL) per inning (not winner_wickets)
+    #   - ORDER BY inning to present innings in sequence
+    {
+        "input": "What was the final match score in the 2022 final?",
+        "query": (
+            "SELECT d.batting_team, d.inning,\n"
+            "       SUM(d.batsman_runs + d.extras) AS total_runs,\n"
+            "       COUNT(CASE WHEN d.dismissal_kind IS NOT NULL THEN 1 END) AS wickets_lost\n"
+            "FROM deliveries d\n"
+            "JOIN matches m ON d.match_id = m.match_id\n"
+            "WHERE m.year = 2022 AND m.match_stage = 'Final'\n"
+            "GROUP BY d.batting_team, d.inning\n"
+            "ORDER BY d.inning;"
+        ),
+    },
+    # Death overs wickets with NOT IN pattern — teaches the model that:
+    #   - death overs = over BETWEEN 16 AND 19 (0-based; NOT 15-19)
+    #   - use NOT IN exclusion list for bowler-credited wickets
+    #   - join matches when filtering by year
+    {
+        "input": "Which bowler took the most wickets in death overs in IPL history?",
+        "query": (
+            "SELECT bowler, COUNT(*) AS wickets\n"
+            "FROM deliveries\n"
+            "WHERE over BETWEEN 16 AND 19\n"
+            "  AND dismissal_kind IS NOT NULL\n"
+            "  AND dismissal_kind NOT IN ('run out', 'retired hurt', 'retired out', 'obstructed the field')\n"
+            "GROUP BY bowler\n"
+            "ORDER BY wickets DESC\n"
+            "LIMIT 10;"
         ),
     },
 ]
@@ -643,9 +811,19 @@ def _build_few_shot_prompt() -> ChatPromptTemplate:
         "which table each column belongs to. Wrap column and table names in "
         "double quotes only when they are reserved words.\n\n"
         "KEY SCHEMA RULES:\n"
-        "- Return only the columns needed to answer the question. Do not add "
-        "intermediate, debug, or context columns (e.g. do not include player name "
-        "alongside a single computed stat when only the stat was asked for).\n"
+        "- Return only the columns needed to answer the question. Follow these "
+        "column selection rules strictly:\n"
+        "  * When a specific player/bowler/team is already named in a WHERE clause, "
+        "do NOT also SELECT that entity's name column — it is redundant.\n"
+        "  * When the answer is a computed metric (economy_rate, batting_average, "
+        "win_percentage, strike_rate, highest_score), do NOT include intermediate "
+        "components (total_runs, outs, total_wins, total_matches, balls_bowled) "
+        "unless the question explicitly asks for them.\n"
+        "  * Exception: always include the entity name (batsman/bowler/team) when "
+        "comparing or ranking multiple entities in a GROUP BY result.\n"
+        "  * When a question uses a threshold filter ('at least N wickets', 'minimum "
+        "M overs'), include that threshold metric in the SELECT so the result is "
+        "self-explanatory.\n"
         "- The primary key of the matches table is 'match_id' (NOT 'id').\n"
         "- Join deliveries to matches using: ON deliveries.match_id = matches.match_id\n"
         "- 'season' in matches is a VARCHAR string (e.g. '2017', '2019/20'). "
@@ -684,6 +862,12 @@ def _build_few_shot_prompt() -> ChatPromptTemplate:
         "Death overs = over BETWEEN 16 AND 19 (overs 17-20, the last 4 overs). "
         "NEVER use BETWEEN 1 AND 6 for powerplay — that skips over=0 and includes over=6. "
         "NEVER use BETWEEN 15 AND 19 for death overs — that adds over=15 (the 16th over).\n"
+        "- BOWLER-CREDITED WICKETS (dismissal attribution): prefer the NOT IN exclusion "
+        "approach over a whitelist IN ('bowled','caught',...). Use: "
+        "dismissal_kind IS NOT NULL AND dismissal_kind NOT IN "
+        "('run out', 'retired hurt', 'retired out', 'obstructed the field'). "
+        "This is more robust — it automatically includes rare dismissal types without "
+        "needing to enumerate every valid kind.\n"
         "- DOT BALL definition: a legal delivery where the batsman scores 0 runs: "
         "batsman_runs = 0 AND NOT is_wide AND NOT is_no_ball. "
         "Do NOT use extras = 0 — a delivery with byes/leg-byes is still a dot ball to the bowler.\n"

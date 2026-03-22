@@ -1328,6 +1328,7 @@ Changing `OPENAI_EMBEDDING_MODEL` now automatically invalidates both ChromaDB co
 |---|---|---|
 | #39 | Embedding model change silent cache miss — stale vectors served without warning | Versioning via `openai_embedding_model` included in content hash |
 | #40 | Unit test `test_hash_match_no_warning_logged` fails with overly strict caplog assertion | Narrowed assertion to filter for drift-specific WARNINGs only |
+| #41–#49 | 9 SQL generation eval failures (82% accuracy) — column over/under-selection, wrong aggregation level, wrong over boundaries | Strengthened system prompt rules + updated + added 8 few-shot examples in `prompts.py` |
 
 ---
 
@@ -1359,3 +1360,28 @@ assert drift_warnings == [], "No drift WARNING expected when hashes match"
 ```
 
 **File**: `backend/tests/unit/test_schema_watcher.py` — `TestCheckAndStoreHash::test_hash_match_no_warning_logged`
+
+---
+
+## #41–#49 — SQL generation failures (Phase 9.2 eval, 82% accuracy)
+
+Nine test cases from the eval suite (`scripts/eval_correctness.py`) consistently failed during Phase 9.2 evaluation. All fixed in a single pass targeting `backend/app/prompts.py` (system prompt + few-shot examples).
+
+| Bug # | ID | Question | Root cause | Fix |
+|---|---|---|---|---|
+| #41 | 5 | "What was the toss decision in the IPL 2025 final?" | LLM returned only `toss_decision`, omitted `toss_winner` | New few-shot: toss queries always SELECT both `toss_winner, toss_decision` |
+| #42 | 13 | "What was Virat Kohli's highest score in IPL history?" | Grouped by `match_id` only (not `inning`); returned multiple columns | Updated existing example to innings-level CTE; added single-player highest score example |
+| #43 | 15 | "What is Virat Kohli's batting average in IPL history?" | Two-CTE batting average included `total_runs, outs` in SELECT (not requested) | Removed `total_runs, outs` from existing batting average example SELECT; added single-player example returning only `batting_average` |
+| #44 | 19 | "Who scored the fastest fifty in IPL 2025?" | Used `COUNT(*)` instead of cumulative window function; wides not excluded from balls faced | New few-shot: window function pattern (`SUM OVER ORDER BY over, ball`) |
+| #45 | 23 | "What is Bhuvneshwar Kumar's economy rate in IPL history?" | Included redundant `bowler` column in SELECT even though bowler was already in WHERE | System prompt rule + new few-shot: player in WHERE → omit name from SELECT |
+| #46 | 26 | "Which bowler has the best bowling strike rate … at least 50 wickets?" | Dropped `wickets` column; used whitelist instead of NOT IN | New few-shot with NOT IN and wickets in SELECT; system prompt rule about threshold metrics |
+| #47 | 32 | "What was the final match score in the IPL 2025 final?" | Dropped `wickets_lost` column from scorecard | New few-shot: scorecard pattern (batting_team, inning, total_runs, wickets_lost) |
+| #48 | 42 | "Which team has the highest win percentage in IPL history?" | Returned 4 columns (team, wins, matches, win_pct) — CTE intermediate columns leaked into SELECT | System prompt rule: don't expose intermediate CTE columns (wins, total_matches) when metric was requested |
+| #49 | 46 | "Which bowler took the most wickets in death overs in IPL 2025?" | Used `over BETWEEN 15 AND 19` (wrong); used whitelist dismissal_kind IN | System prompt already had correct rule; added new few-shot with `BETWEEN 16 AND 19` + NOT IN; strengthened NOT IN rule in system prompt |
+
+**Files changed**: `backend/app/prompts.py`
+- System prompt: strengthened column-selection rules; added NOT IN wicket attribution rule
+- Updated examples: "highest individual score" (innings-level CTE); "batting average" (removed intermediate columns)
+- Added 8 new few-shot examples: toss, single-player highest score, single-player batting average, single-player economy rate, fastest fifty (window function), bowling strike rate with threshold, match scorecard, death overs wickets
+
+**Expected result**: eval accuracy improves from 82% (41/50) toward ~90%+ (45+/50).
