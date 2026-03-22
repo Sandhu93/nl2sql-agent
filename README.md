@@ -10,10 +10,6 @@ This project is an NL2SQL analytics agent for IPL data. It translates natural-la
 - **9 PostgreSQL tables**
 - Supports **follow-up questions**, **streaming responses**, and **on-demand charts**
 
-```bash
-docker compose up --build
-```
-
 ---
 
 ![Demo](demo.gif)
