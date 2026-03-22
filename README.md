@@ -1,120 +1,144 @@
 # IPL Cricket Analyst
 
-A production-ready conversational AI agent that answers natural-language questions
-about IPL cricket data. Ask anything — the agent generates and executes PostgreSQL
-in real time, streams results back as they arrive, and adds analyst-grade insights,
-follow-up suggestions, and on-demand charts.
+Ask IPL cricket questions in plain English and get back SQL, answers, insights, and charts.
 
-Built with **LangChain**, **FastAPI**, **Next.js 14**, **Redis**, and **ChromaDB**.
-Accuracy: **98%** on a 50-question ground-truth eval suite (278k+ delivery rows, 9 tables).
+This project is an NL2SQL analytics agent for IPL data. It translates natural-language questions into SQL, executes them safely against a PostgreSQL database, and streams back results with analyst-style explanations and optional visualizations.
 
-**Dataset**: [IPL Cricket Dataset (2008–2025) — PostgreSQL](https://www.kaggle.com/datasets/sandeepbkadam/ipl-cricket-dataset-20082025-postgresql)
+**Highlights**
+- **98% accuracy** on a 50-question ground-truth evaluation
+- **278k+ ball-by-ball deliveries**
+- **9 PostgreSQL tables**
+- Supports **follow-up questions**, **streaming responses**, and **on-demand charts**
 
+```bash
+docker compose up --build
 ```
-nl2sql_agent/
-├── backend/
-│   ├── app/
-│   │   ├── main.py              ← FastAPI app, CORS, global error handler, lifespan hook
-│   │   ├── config.py            ← pydantic-settings (reads from .env)
-│   │   ├── limiter.py           ← slowapi Limiter singleton (Redis-backed, in-memory fallback)
-│   │   ├── agent.py             ← ⭐ orchestrator: run_agent() entry point
-│   │   ├── sql_helpers.py       ← SQL parsing, execution & output validation
-│   │   ├── prompts.py           ← 27 IPL few-shot examples + prompt template (ChromaDB dynamic selection)
-│   │   ├── table_selector.py    ← CSV-backed table description helpers
-│   │   ├── input_validator.py   ← input sanitization & prompt injection defence
-│   │   ├── entity_resolver.py   ← player full-name → canonical dataset-name mapping
-│   │   ├── cricket_knowledge.py ← RAG: loads cricket_rules.md into ChromaDB
-│   │   ├── cricket_rules.md     ← canonical cricket stats spec (~1300 lines, 26 §§)
-│   │   ├── insights_agent.py    ← insight generation (key takeaway + follow-up chips)
-│   │   ├── viz_agent.py         ← visualization intent detection + Vega-Lite spec gen via MCP
-│   │   ├── schema_watcher.py    ← startup schema drift detection + data coverage logging
-│   │   ├── database_table_descriptions.csv
-│   │   └── routes/
-│   │       └── query.py         ← POST /api/query + POST /api/query/stream; UUID v4 validator; 60s timeout; 429/503/504
-│   ├── tests/
-│   │   ├── unit/                ← 443 unit tests (no Docker needed)
-│   │   └── integration/         ← real HTTP tests against the running stack
-│   ├── Dockerfile
-│   └── requirements.txt
-├── mcp_chart_server/
-│   ├── server.py                ← FastMCP SSE server — deterministic Vega-Lite v5 spec
-│   └── Dockerfile
-├── frontend/
-│   ├── app/
-│   │   ├── layout.tsx
-│   │   └── page.tsx             ← chat UI; thread_id persisted in localStorage; "New session" button
-│   ├── components/
-│   │   ├── ChatMessage.tsx
-│   │   ├── SqlBlock.tsx
-│   │   ├── InsightsCard.tsx     ← key takeaway + clickable follow-up chips
-│   │   └── ChartBlock.tsx       ← Vega-Lite chart renderer (vega-embed, SSR-safe)
-│   ├── lib/
-│   │   └── api.ts               ← fetch wrapper for /api/query
-│   ├── __tests__/
-│   │   └── page.test.tsx        ← 27 Jest unit tests (localStorage, session, submit flow, errors)
-│   ├── jest.config.ts           ← Jest config (jsdom, ts-jest, @/ alias)
-│   ├── jest.setup.ts            ← jest-dom matchers + JSDOM polyfills
-│   ├── Dockerfile
-│   └── .env.local.example
-├── scripts/
-│   ├── eval_testcases.json      ← 50 ground-truth NL→SQL test cases
-│   ├── eval.py                  ← evaluation script (hits live API, compares results)
-│   └── eval_report.md           ← auto-generated accuracy report (latest: 98%)
-├── docker-compose.yml
-├── .env.example
-├── bugs.md                      ← all 58 bugs logged here
-├── tutorial_progression.md      ← full dev history (Phases 0–15)
-└── README.md                    ← you are here
-```
+
+---
+
+![Demo](demo.gif)
+
+---
+
+## Overview
+
+IPL Cricket Analyst is built for querying IPL data conversationally.
+
+Instead of writing SQL manually, users can ask questions such as:
+
+- *"Who scored the most runs in 2023?"*
+- *"What was his strike rate?"*
+- *"Show that as a chart."*
+
+The agent keeps track of conversation context, generates SQL, validates it, executes it, and returns:
+
+- the generated SQL
+- a natural-language answer
+- follow-up insights
+- a chart when requested
+
+It is designed to be fast, safe, and accurate for cricket-specific analytics.
+
+---
+
+## Key features
+
+**Natural-language IPL analytics**
+Ask questions in plain English without knowing SQL or the schema.
+
+**Multi-turn follow-ups**
+The agent resolves references like "his", "that season", or "show that as a chart" using conversation history.
+
+**Streaming responses**
+SQL appears first, then the answer, then insights and charts as they are generated.
+
+**Cricket-aware correctness**
+The system applies IPL-specific rules for batting, bowling, innings aggregation, and fielding statistics.
+
+**On-demand chart generation**
+Users can request visualizations and receive rendered Vega-Lite charts inline.
+
+**Production-oriented safeguards**
+Includes input validation, SELECT-only SQL enforcement, semantic SQL validation, rate limiting, circuit breaking, and optional API key authentication.
 
 ---
 
 ## How it works
 
-Each question passes through a validation + pipeline sequence:
+Each user question flows through the agent pipeline inside `run_agent_stream()`:
 
-**Validation layers** (before and after the LLM):
+```
+Input validation
+→ Response cache
+→ Query rewrite + history summarization
+→ Entity resolution
+→ [Table selection ∥ Cricket RAG]
+→ SQL generation (27 few-shot examples, k=3 dynamic selection)
+→ SQL validation + semantic check
+→ SQL execution (auto-fix retry ×2)
+→ [Answer rephrase ∥ Insights generation ∥ Viz agent]  ← parallel
+→ Streamed NDJSON back to frontend
+```
 
-| Layer | Module | What happens |
-|-------|--------|--------------|
-| thread_id validation | `routes/query.py` | Rejects any `thread_id` that is not a well-formed UUID v4, preventing Redis key injection. Returns HTTP 422. |
-| Input validation | `input_validator.py` | Checks length (max 500 chars), detects prompt injection patterns, blocks SQL DDL keywords in the question. Returns HTTP 400. |
-| SQL output validation | `sql_helpers.py` | Blocks any non-SELECT statement generated by the LLM before it reaches the database. Returns HTTP 200 with a safe refusal. |
-| SQL semantic validation | `sql_helpers.py` | Detects logical SQL grain mistakes (e.g. `batsman_runs = 119`) and triggers auto-correction before execution. |
+### Why it stays accurate
 
-**Pipeline** (`run_agent_stream()` in `agent.py`, consumed by both the streaming and JSON endpoints):
+The agent is grounded with:
 
-| Step | Module | What happens |
-|------|--------|--------------|
-| Cache lookup | `agent.py` | On first-turn questions, checks Redis for a cached answer (SHA-256 key, 1h TTL). Returns immediately on hit; still updates history for follow-up context. |
-| 0. Query rewrite | `agent.py` | Rewrites ambiguous follow-ups into standalone questions using conversation history (skipped on the first turn). Long threads (>8 messages) are first compressed into a 2–4 bullet summary via `_maybe_summarize_history()` to keep context compact. |
-| 0b. Entity resolution | `entity_resolver.py` | Resolves full player names to canonical short names used in tables (e.g. `Sanju Samson` → `SV Samson`) |
-| 1. Table selection + Cricket RAG | `table_selector.py` + `cricket_knowledge.py` | Run in parallel: LLM picks relevant tables; ChromaDB retrieves the 3 most relevant cricket rules sections for context injection |
-| 2. SQL generation | `prompts.py` | LLM writes PostgreSQL using dynamic few-shot examples (27 examples, ChromaDB k=3) + injected cricket domain rules |
-| 3. SQL cleaning | `sql_helpers.py` | Strips markdown fences, prefixes, and prose from LLM output |
-| 4. Execution + retry | `sql_helpers.py` | Runs the SQL; on error, asks the LLM to correct it (up to 2 retries) |
-| 5. Rephrase + Insights + Viz | `agent.py` + `insights_agent.py` + `viz_agent.py` | Run in parallel: converts result to natural language; generates key takeaway + follow-up chips; optionally generates a Vega-Lite chart spec if the question requests a visualization |
+- a 1300-line cricket rules specification
+- 27 IPL-specific few-shot SQL examples
+- retrieval over schema and cricket logic
+- semantic SQL validation before execution
 
-Conversation history is stored per `thread_id` in Redis (`RedisChatMessageHistory`, 24h sliding TTL)
-and persisted in the browser's `localStorage` so sessions survive page refreshes.
-Follow-up questions like *"and what about in 2017?"* resolve correctly within the same chat session.
+This helps it produce correct answers for cricket-specific questions such as strike rate, economy, innings-level totals, and fielding stats.
+
+### Conversation memory
+
+Conversation history is stored per `thread_id` in Redis and also persisted in `localStorage`, so sessions survive page refreshes.
 
 ---
 
-## Prerequisites
+## Architecture
+
+![Architecture](architecture.png)
+
+| Layer | Technology |
+|-------|-----------|
+| Frontend | Next.js 14 · TypeScript · Tailwind CSS |
+| Backend | FastAPI · Python 3.11 · LangChain |
+| Database | PostgreSQL (`ipl_db`) — 9 tables, 278k+ rows |
+| Vector store | ChromaDB — disk-persistent, embedding-versioned |
+| Cache / History | Redis 7 — conversation history (24h TTL) + response cache (1h TTL) |
+| LLM | GPT-4o (SQL) · GPT-4o-mini (rewrite, insights, rephrase) |
+| Charts | MCP Chart Server — deterministic Vega-Lite v5 specs |
+
+**Dataset**: [IPL Cricket Dataset (2008–2025) — PostgreSQL](https://www.kaggle.com/datasets/sandeepbkadam/ipl-cricket-dataset-20082025-postgresql)
+
+---
+
+## Project structure
+
+```
+frontend/      — Next.js UI for chat, streaming, and chart rendering
+backend/       — FastAPI app, agent pipeline, prompts, validation, and SQL execution
+scripts/       — evaluation scripts and test cases
+```
+
+Redis, ChromaDB, and PostgreSQL run as supporting services via Docker Compose.
+
+---
+
+## Quick start
+
+### Prerequisites
 
 | Tool | Version |
 |------|---------|
 | Docker | 24+ |
-| Docker Compose | v2 (bundled with Docker Desktop) |
+| Docker Compose | v2 |
 | Node.js (local dev only) | 20+ |
 | Python (local dev only) | 3.11+ |
 
----
-
-## Setup
-
-### 1. Clone & configure
+### 1. Clone the repository
 
 ```bash
 git clone <your-repo-url> nl2sql_agent
@@ -122,56 +146,57 @@ cd nl2sql_agent
 cp .env.example .env
 ```
 
-Edit `.env` and fill in your values:
+### 2. Configure environment variables
 
-```
+Edit `.env`:
+
+```env
 OPENAI_API_KEY=sk-...
 DB_USER=postgres
-DB_PASSWORD=1234
-DB_HOST=host.docker.internal   # host machine DB; use service name for a Compose-managed DB
+DB_PASSWORD=yourpassword
+DB_HOST=host.docker.internal
 DB_PORT=5432
 DB_NAME=ipl_db
 ```
 
-### 2. Create the database
+### 3. Create the database
 
 ```bash
 psql -U postgres -c "CREATE DATABASE ipl_db;"
 ```
 
-Then load your IPL data (matches and deliveries tables) into `ipl_db`.
+Then import the IPL dataset into `ipl_db` using the dataset linked above.
 
-### 3. Run with Docker Compose
+### 4. Start the stack
 
 ```bash
 docker compose up --build
 ```
 
+### 5. Open the app
+
 | Service | URL |
 |---------|-----|
-| Frontend (Next.js) | http://localhost:8085 |
-| Backend (FastAPI) | http://localhost:8086 |
-| API docs (Swagger) | http://localhost:8086/docs |
+| Frontend | http://localhost:8085 |
+| Backend | http://localhost:8086 |
+| Swagger docs | http://localhost:8086/docs |
 | Health check | http://localhost:8086/health |
 
-Stop everything:
-
 ```bash
-docker compose down
+docker compose down   # stop everything
 ```
 
 ---
 
-## Local development (without Docker)
+## Local development
 
 ### Backend
 
 ```bash
 cd backend
 python -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-cp ../.env.example .env            # or symlink to the root .env
 uvicorn app.main:app --reload --port 8086
 ```
 
@@ -181,27 +206,28 @@ uvicorn app.main:app --reload --port 8086
 cd frontend
 npm install
 cp .env.local.example .env.local
-npm run dev                        # starts on port 8085
+npm run dev
 ```
 
 ---
 
-## API reference
+## Using the API
 
 ### `GET /health`
 
-Returns `{"status": "ok"}` when the backend is running.
+Returns:
+
+```json
+{"status": "ok"}
+```
+
+---
 
 ### `POST /api/query`
 
-**Headers**
+Returns a full response after processing completes.
 
-| Header | Required | Description |
-|--------|----------|-------------|
-| `Content-Type` | Yes | Must be `application/json` |
-| `X-API-Key` | When `API_KEY` is set | API key for authentication — see [Authentication](#authentication) |
-
-**Request body**
+**Request**
 
 ```json
 {
@@ -210,132 +236,93 @@ Returns `{"status": "ok"}` when the backend is running.
 }
 ```
 
-`thread_id` must be a valid **UUID v4** string. The frontend generates one via `crypto.randomUUID()`
-and persists it in `localStorage` so the same session ID is reused across page refreshes.
+`thread_id` must be a valid UUID v4. The frontend generates and persists one automatically.
 
-**Response (200)**
+**Response**
 
 ```json
 {
   "answer": "Virat Kohli scored the most runs in IPL 2016 with 973 runs.",
-  "sql": "SELECT batsman, SUM(batsman_runs) AS total_runs FROM deliveries d JOIN matches m ON d.match_id = m.match_id WHERE m.year = 2016 GROUP BY batsman ORDER BY total_runs DESC LIMIT 1;",
+  "sql": "SELECT batsman, SUM(batsman_runs) AS total_runs ...",
   "insights": {
     "key_takeaway": "Virat Kohli dominated IPL 2016 with 973 runs.",
-    "follow_up_chips": ["How many hundreds did he score?", "Who was second in 2016?", "What was his strike rate in 2016?"]
+    "follow_up_chips": [
+      "How many hundreds did he score?",
+      "Who was second?",
+      "What was his strike rate?"
+    ]
   },
   "chart_spec": null
 }
 ```
 
-**Error responses**
-
-| Status | Cause |
-|--------|-------|
-| 400 | Question failed input validation (too long, injection detected, SQL keywords) |
-| 401 | `X-API-Key` header missing (auth is enabled but no key was sent) |
-| 403 | `X-API-Key` header present but incorrect |
-| 422 | `thread_id` is not a valid UUID v4 |
-| 429 | Per-IP rate limit exceeded (20 req/min default) or OpenAI rate limit hit |
-| 503 | LLM circuit breaker open (≥5 consecutive LLM failures — retries after 60s) |
-| 504 | Request timed out after 60s |
-
-All error responses have the shape `{"detail": "..."}`.
-
 ---
 
 ### `POST /api/query/stream`
 
-Streaming variant of `/api/query`. Accepts the same request body and headers, returns `application/x-ndjson` — one JSON object per line as each pipeline milestone completes.
+Returns `application/x-ndjson` and streams pipeline milestones as they complete.
 
-**Event sequence**
+**Event types**
 
-| Event | When | Payload |
-|-------|------|---------|
-| `sql_ready` | SQL generated (~1s) | `{"type": "sql_ready", "sql": "..."}` |
-| `answer_ready` | Natural-language answer ready | `{"type": "answer_ready", "answer": "..."}` |
-| `insights_ready` | Key takeaway + follow-up chips ready | `{"type": "insights_ready", "insights": {...}}` |
-| `chart_ready` | Chart spec ready (only when viz was requested) | `{"type": "chart_ready", "chart_spec": {...}}` |
-| `error` | Unrecoverable mid-stream error | `{"type": "error", "error": "..."}` |
+| Event | Payload |
+|-------|---------|
+| `sql_ready` | `{"type": "sql_ready", "sql": "..."}` |
+| `answer_ready` | `{"type": "answer_ready", "answer": "..."}` |
+| `insights_ready` | `{"type": "insights_ready", "insights": {...}}` |
+| `chart_ready` | `{"type": "chart_ready", "chart_spec": {...}}` |
+| `error` | `{"type": "error", "error": "..."}` |
 
-The frontend uses this endpoint. `sql_ready` arrives first so the SQL block renders while the answer is still being generated. `insights_ready` and `chart_ready` pop in as they complete in parallel.
+The frontend uses this endpoint exclusively so users can see SQL immediately while the rest of the response is still being generated.
+
+---
+
+### Error handling
+
+All error responses use `{"detail": "..."}`.
+
+| Status | Cause |
+|--------|-------|
+| 400 | Input validation failed (too long, injection detected, SQL keywords in question) |
+| 401 | `X-API-Key` header missing |
+| 403 | `X-API-Key` incorrect |
+| 422 | `thread_id` is not a valid UUID v4 |
+| 429 | Per-IP rate limit exceeded (20 req/min) or OpenAI rate limit hit |
+| 503 | Circuit breaker open after repeated LLM failures |
+| 504 | Request timed out after 60s |
 
 ---
 
 ## Authentication
 
-The `/api/query` endpoint supports **API key authentication** (Phase 16). The `/health` endpoint is always public.
+Authentication is disabled by default for local development.
 
-### How it works
+To enable API key auth, generate a key:
 
-When `API_KEY` is set in `.env`, every request to `/api/query` must include:
-
-```
-X-API-Key: <your-key>
+```bash
+python -c "import secrets; print(secrets.token_hex(32))"
 ```
 
-| Condition | Result |
-|-----------|--------|
-| `API_KEY` not set | Auth disabled — all requests pass (safe default for local dev) |
-| Header missing | HTTP 401 |
-| Header present but wrong | HTTP 403 |
-| Header correct | Request proceeds normally |
-
-### Enabling auth in local Docker
-
-1. Generate a key:
-   ```bash
-   python -c "import secrets; print(secrets.token_hex(32))"
-   ```
-2. Add both to `.env`:
-   ```env
-   API_KEY=<generated-key>
-   NEXT_PUBLIC_API_KEY=<same-key>
-   ```
-3. Rebuild (required — see note below):
-   ```bash
-   docker compose up --build
-   ```
-
-> **Why `--build` is required when changing the key**
->
-> Next.js inlines `NEXT_PUBLIC_*` variables into the client-side JavaScript bundle at **build
-> time**, not at runtime. `NEXT_PUBLIC_API_KEY` is passed as a Docker build argument and embedded
-> into the bundle during `npm run build`. Changing the value in `.env` without rebuilding leaves
-> the old (or absent) key baked into the bundle — the browser will send the wrong header.
->
-> The backend reads `API_KEY` at startup via pydantic-settings, so a plain restart
-> (`docker compose restart backend`) is sufficient for backend-only changes, but a full
-> `--build` is the safest single command that keeps both sides in sync.
-
-### Enabling auth in production
-
-Same steps, but use your production domain in `.env`:
+Then add it to `.env`:
 
 ```env
 API_KEY=<generated-key>
 NEXT_PUBLIC_API_KEY=<same-key>
-NEXT_PUBLIC_BACKEND_URL=https://your-backend-domain.com
-ALLOWED_ORIGINS=["https://your-frontend-domain.com"]
 ```
 
-Then deploy:
+Rebuild the app:
+
 ```bash
-docker compose up --build -d
+docker compose up --build
 ```
 
-**Rotating the key**: update both `API_KEY` and `NEXT_PUBLIC_API_KEY` in `.env`, then run
-`docker compose up --build`. The old key stops working immediately on backend restart; the
-frontend bundle is updated on the next client page load after the rebuild.
-
-> **Security note**: `NEXT_PUBLIC_API_KEY` is visible in the browser's JavaScript bundle — this
-> is expected for a single-tenant API key setup. If you need per-user access control, replace
-> this with JWT authentication.
+> `NEXT_PUBLIC_API_KEY` is exposed in the browser bundle, which is acceptable for single-tenant/local use.
+> For real multi-user access control, replace this with JWT-based authentication.
 
 ---
 
-## Running tests
+## Testing
 
-### Backend unit tests (no Docker required)
+### Backend unit tests
 
 ```bash
 cd backend
@@ -343,11 +330,11 @@ pip install -r requirements.txt
 pytest tests/unit -v
 ```
 
-443 unit tests covering: rewrite guard, response cache, circuit breaker, input validator,
-SQL helpers, viz helpers, insights helpers, embedding versioning, history summarization,
-UUID v4 validator, summarization security hardening.
+443 unit tests covering: rewrite guards, response cache, circuit breaker, input validation,
+SQL helpers, visualization helpers, insights, embedding versioning, history summarization,
+UUID v4 validation.
 
-### Backend integration tests (requires running Docker stack)
+### Backend integration tests
 
 ```powershell
 .\run_tests.ps1
@@ -360,65 +347,57 @@ cd frontend
 npm test
 ```
 
-27 Jest tests covering: localStorage thread_id persistence, session management,
-full submission flow, error handling, and initial render state.
+27 Jest tests covering: localStorage persistence, session management, streaming event
+handling, error states, initial render.
 
 ---
 
-## Correctness evaluation
+## Evaluation
 
-A 50-question ground-truth test suite lives in `scripts/eval_testcases.json`. Each entry has a natural-language question, a reference SQL query, and category metadata.
-
-Run the evaluation against the live API:
+A 50-question ground-truth evaluation suite is available in `scripts/eval_testcases.json`.
 
 ```bash
 cd scripts
 python eval.py
 ```
 
-Results are written to `scripts/eval_report.md`. Latest run: **98% accuracy** (49/50 PASS).
+Results are written to `scripts/eval_report.md`. Latest result: **98% accuracy (49/50 PASS)**.
 
-To improve accuracy, edit `prompts.py` (add or refine few-shot examples, adjust system prompt rules), restart the Docker backend to rebuild the ChromaDB vector store, then re-run the script.
-
----
-
-## Extending the agent
-
-### Add more few-shot examples
-
-Open [backend/app/prompts.py](backend/app/prompts.py) and add entries to `IPL_EXAMPLES`.
-Each entry needs `"input"` (natural-language question) and `"query"` (correct SQL).
-The dynamic selector automatically picks the most relevant ones at query time — no other
-changes needed. Restart the backend to rebuild the ChromaDB vector store.
-
-### Add more tables
-
-Add a row to [backend/app/database_table_descriptions.csv](backend/app/database_table_descriptions.csv)
-with the table name and a plain-English description of its columns. The table selector
-and SQL generator adapt automatically.
-
-### Improve SQL error correction
-
-Edit the fix prompt in `_fix_sql()` in [backend/app/agent.py](backend/app/agent.py),
-or increase `_MAX_SQL_RETRIES` for more correction attempts.
-
-### Adjust input validation rules
-
-Open [backend/app/input_validator.py](backend/app/input_validator.py) to:
-- Change `_MAX_QUESTION_LENGTH` (default: 500 characters)
-- Add new prompt injection patterns to `_INJECTION_PATTERNS`
-- Add SQL keywords to `_DANGEROUS_SQL_IN_INPUT` that should be blocked in questions
-
-### Change the embedding model
-
-Set `OPENAI_EMBEDDING_MODEL` in `.env` (default: `text-embedding-3-small`). Both ChromaDB
-collections include the model name in their content hash — changing the model automatically
-invalidates and rebuilds the vector stores on next startup.
+To improve accuracy: update or add examples in `backend/app/prompts.py`, restart the backend
+to rebuild ChromaDB, then re-run the evaluation.
 
 ---
 
-## Production deployment
+## Extending the project
 
-- Set `--reload` → `False` in the backend `Dockerfile` `CMD`.
-- Point `ALLOWED_ORIGINS` and `NEXT_PUBLIC_BACKEND_URL` at your real domain.
-- Add a reverse proxy (nginx / Caddy) in front of both services.
+**Add few-shot examples** — add entries to `IPL_EXAMPLES` in `backend/app/prompts.py`.
+Each needs `"input"` (question) and `"query"` (correct SQL). The selector dynamically
+chooses the most relevant k=3 examples at runtime.
+
+**Add tables** — add a row to `backend/app/database_table_descriptions.csv`. The table
+selector and SQL generator will automatically pick up the new schema description.
+
+**Change the embedding model** — set `OPENAI_EMBEDDING_MODEL` in `.env`. Both ChromaDB
+collections are embedding-versioned and rebuild automatically on the next startup.
+
+**Adjust input validation** — edit `_MAX_QUESTION_LENGTH`, `_INJECTION_PATTERNS`, or
+`_DANGEROUS_SQL_IN_INPUT` in `backend/app/input_validator.py`.
+
+---
+
+## Deployment notes
+
+- Set `--reload` to `False` in the backend Docker `CMD`
+- Configure `ALLOWED_ORIGINS` and `NEXT_PUBLIC_BACKEND_URL` for your real domain
+- Place a reverse proxy such as nginx or Caddy in front of the services
+- Replace single-key auth with proper user authentication if needed
+
+---
+
+## Why this project is useful
+
+This project is a practical example of a domain-aware NL2SQL system that goes beyond generic text-to-SQL demos.
+
+It combines domain grounding, retrieval-augmented generation, semantic SQL safeguards,
+streaming UX, conversational memory, and chart generation — making it useful both as a
+real IPL analytics assistant and as a reference architecture for production-style NL2SQL agents.
