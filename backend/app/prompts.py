@@ -533,12 +533,11 @@ def _get_few_shot_selector(
             persist_directory=str(persist_dir),
         )
         logger.info("Few-shot selector loaded from disk | dir=%s", persist_dir)
-        # Provide IPL_EXAMPLES so the selector's .examples attribute is populated;
-        # select_examples() uses metadata from the vectorstore search results, not
-        # this list directly, but the attribute is part of the public interface.
+        # NOTE: do not pass `examples=` here — langchain-core rejects extra fields
+        # in strict Pydantic v1 validation. Examples are stored in / retrieved from
+        # the vectorstore metadata; the selector does not need the raw list.
         return SemanticSimilarityExampleSelector(
             vectorstore=vectorstore,
-            examples=IPL_EXAMPLES,
             k=3,
             input_keys=["input"],
         )
