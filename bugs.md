@@ -1327,3 +1327,35 @@ Changing `OPENAI_EMBEDDING_MODEL` now automatically invalidates both ChromaDB co
 | # | Bug | Fix |
 |---|---|---|
 | #39 | Embedding model change silent cache miss — stale vectors served without warning | Versioning via `openai_embedding_model` included in content hash |
+| #40 | Unit test `test_hash_match_no_warning_logged` fails with overly strict caplog assertion | Narrowed assertion to filter for drift-specific WARNINGs only |
+
+---
+
+## #40 — Unit test `test_hash_match_no_warning_logged` overly strict assertion
+
+**Symptom**
+```
+FAILED tests/unit/test_schema_watcher.py::TestCheckAndStoreHash::test_hash_match_no_warning_logged
+AssertionError: No WARNING expected when hashes match
+assert [<LogRecord: ... missing=%s">] == []
+```
+
+**Root cause**
+`test_hash_match_no_warning_logged` supplied only 1 of the 9 `KNOWN_TABLES` in its mock cursor rows (`"deliveries"` only). Inside `_check_and_store_hash`, the call to `_build_schema_fingerprint` detects the 8 missing tables and logs a WARNING (`"Schema watcher: expected tables missing from DB | missing=..."`). The test assertion `assert caplog.records == []` treats *any* WARNING as a failure, so the unrelated missing-table WARNING caused the test to fail even though the hash-comparison branch (Branch C) produced no drift warning.
+
+**Fix**
+Narrowed the assertion in `test_hash_match_no_warning_logged` to check for absence of *drift*-specific warnings only, consistent with the pattern already used in `test_no_stored_hash_no_drift_warning`:
+
+```python
+# Before — too strict: fails if any WARNING is logged
+assert caplog.records == [], "No WARNING expected when hashes match"
+
+# After — checks only that no drift WARNING was logged by the branch under test
+drift_warnings = [
+    r for r in caplog.records
+    if r.levelno == logging.WARNING and "drift" in r.getMessage().lower()
+]
+assert drift_warnings == [], "No drift WARNING expected when hashes match"
+```
+
+**File**: `backend/tests/unit/test_schema_watcher.py` — `TestCheckAndStoreHash::test_hash_match_no_warning_logged`

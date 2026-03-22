@@ -1,5 +1,6 @@
 import logging
 import logging.config
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,6 +11,7 @@ from slowapi.middleware import SlowAPIMiddleware
 from app.config import get_settings
 from app.limiter import limiter
 from app.routes.query import router as query_router
+from app.schema_watcher import run_schema_watcher
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -27,12 +29,37 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 # ---------------------------------------------------------------------------
+# Lifespan — Phase 14: startup tasks (schema drift check)
+# ---------------------------------------------------------------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    FastAPI lifespan context manager.
+
+    Startup tasks run before the first request is served; teardown tasks
+    (after `yield`) run when the server shuts down.
+
+    Current startup tasks:
+      - Schema drift detection: hashes information_schema.columns for the 9
+        known IPL tables, compares against Redis baseline, logs WARNING on
+        drift. Also logs data coverage stats (max_year, match/delivery counts).
+
+    TODO: Add retrieval-eval warm-up ping here when Phase 14b is complete.
+    TODO: Add schema_watcher Prometheus counter export here (Phase 14b).
+    """
+    await run_schema_watcher()
+    yield
+    # TODO: Add graceful shutdown logic here (e.g. flush metrics) as needed.
+
+
+# ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
 app = FastAPI(
     title="NL2SQL Agent API",
     description="Natural-language to SQL agent powered by LangGraph.",
     version="0.1.0",
+    lifespan=lifespan,
     # Disable automatic docs in production if needed — leave enabled for dev.
     docs_url="/docs",
     redoc_url="/redoc",
