@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel, Field, field_validator
 from typing import Any
 import uuid
@@ -18,6 +18,39 @@ _REQUEST_TIMEOUT = 60
 logger = logging.getLogger(__name__)
 router = APIRouter()
 settings = get_settings()
+
+
+# ---------------------------------------------------------------------------
+# API key authentication — Phase 16
+# ---------------------------------------------------------------------------
+
+def verify_api_key(
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> None:
+    """
+    FastAPI dependency that enforces API key auth on protected endpoints.
+
+    Behaviour:
+      - API_KEY not set in .env  → auth disabled, all requests pass through
+      - API_KEY set, header missing  → HTTP 401
+      - API_KEY set, header wrong    → HTTP 403
+      - API_KEY set, header matches  → pass through
+
+    HTTP 401 signals "you need to authenticate"; 403 signals "wrong credentials".
+    The /health endpoint is intentionally excluded (no Depends here).
+    """
+    if settings.api_key is None:
+        return  # auth disabled in dev / when API_KEY is not configured
+    if x_api_key is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="API key required. Include X-API-Key header.",
+        )
+    if x_api_key != settings.api_key:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid API key.",
+        )
 
 
 class QueryRequest(BaseModel):
@@ -63,7 +96,11 @@ class QueryResponse(BaseModel):
     description="Accepts a natural-language question and returns an answer with the generated SQL.",
 )
 @limiter.limit(f"{settings.rate_limit_per_minute}/minute")
-async def query_endpoint(request: Request, body: QueryRequest) -> QueryResponse:
+async def query_endpoint(
+    request: Request,
+    body: QueryRequest,
+    _: None = Depends(verify_api_key),
+) -> QueryResponse:
     """
     POST /api/query
 

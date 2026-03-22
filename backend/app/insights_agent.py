@@ -61,17 +61,36 @@ def _is_rich_output(question: str, rows: list) -> bool:
     richness_terms = (
         "top", "rank", "highest", "lowest", "compare", "comparison",
         "trend", "over time", "by year", "by season", "distribution",
+        "most", "best", "least", "fewest", "worst", "maximum", "minimum",
+        "average", "total", "all time", "career",
     )
     if len(rows) >= 2:
         return True
     return any(term in q for term in richness_terms)
 
 
+_SENTENCE_STARTERS = {
+    "has", "had", "did", "was", "were", "who", "which", "what", "how",
+    "when", "where", "why", "is", "are", "can", "could", "will", "would",
+    "should", "do", "does", "the", "a", "an", "in", "on", "at", "for",
+    "of", "to", "by", "with", "from", "tell", "show", "list", "give",
+}
+
+
 def _extract_player(question: str) -> str | None:
-    matches = re.findall(r"\b([A-Z][a-z]+)\s+([A-Z][a-z]+)\b", question)
-    if not matches:
-        return None
-    return f"{matches[0][0]} {matches[0][1]}"
+    # Use finditer on individual cap-words so we can check adjacent pairs
+    # without the non-overlapping consumption problem of paired findall.
+    cap_words = list(re.finditer(r"\b[A-Z][a-z]+\b", question))
+    for i in range(len(cap_words) - 1):
+        w1, w2 = cap_words[i].group(), cap_words[i + 1].group()
+        # Only consider genuinely adjacent words (just whitespace between)
+        between = question[cap_words[i].end(): cap_words[i + 1].start()]
+        if between.strip():
+            continue
+        if w1.lower() in _SENTENCE_STARTERS:
+            continue
+        return f"{w1} {w2}"
+    return None
 
 
 def _extract_year(question: str) -> str | None:

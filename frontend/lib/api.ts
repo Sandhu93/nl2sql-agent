@@ -8,6 +8,11 @@
 const BACKEND_URL =
   process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8086";
 
+// Phase 16 — API key auth. Set NEXT_PUBLIC_API_KEY in .env to enable.
+// When not set the header is omitted and the backend allows the request through
+// (auth is only enforced when API_KEY is configured on the backend).
+const API_KEY = process.env.NEXT_PUBLIC_API_KEY ?? "";
+
 export interface QueryRequest {
   question: string;
   thread_id: string;
@@ -34,14 +39,13 @@ export interface QueryResponse {
 
 /**
  * POST /api/query — send a natural-language question to the backend agent.
- *
- * TODO: Add auth headers here once authentication is implemented.
  */
 export async function queryAgent(payload: QueryRequest): Promise<QueryResponse> {
   const res = await fetch(`${BACKEND_URL}/api/query`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
+      ...(API_KEY ? { "X-API-Key": API_KEY } : {}),
     },
     body: JSON.stringify(payload),
   });

@@ -132,10 +132,12 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
       args:
-        # Baked into the client-side JS bundle at build time.
-        # To use the public backend domain, override here or set in .env:
-        #   NEXT_PUBLIC_BACKEND_URL: http://localhost:8086
+        # Both NEXT_PUBLIC_* vars are baked into the client-side JS bundle at
+        # build time by Next.js — runtime env vars are NOT available in the browser.
+        # To change either value you must re-run: docker compose up --build
         NEXT_PUBLIC_BACKEND_URL: http://localhost:8086
+        # Phase 16 — API key auth. Reads from .env if set; empty = auth disabled.
+        NEXT_PUBLIC_API_KEY: ${NEXT_PUBLIC_API_KEY:-}
     container_name: nl2sql_frontend
     ports:
       - "8085:8085"

@@ -4,6 +4,58 @@ Chronological record of every bug, error, and issue encountered during developme
 
 ---
 
+## #65 — Venue name exact match fails due to city suffix in database
+
+**Symptom**
+Queries like "What is Kohli's performance at Narendra Modi Stadium?" and "Has Kohli played at Narendra Modi Stadium?" returned empty results. The database stores `'Narendra Modi Stadium, Ahmedabad'` but the LLM generated `WHERE venue = 'Narendra Modi Stadium'` — exact mismatch.
+
+**Root cause**
+Venue names in the `matches` table include a city suffix (e.g. `'Narendra Modi Stadium, Ahmedabad'`, `'Wankhede Stadium, Mumbai'`). There was no system prompt rule about venue matching, so the LLM used exact equality and consistently dropped the city suffix. Additionally, the same stadium has two names in the DB (`'Sardar Patel Stadium, Motera'` pre-2020 rename, `'Narendra Modi Stadium, Ahmedabad'` post-2020).
+
+**Fix**
+Added a system prompt rule in `prompts.py`: "Venue names include the city suffix. Use `ILIKE '%partial_name%'` rather than exact equality when filtering by venue." The ILIKE approach also handles the stadium rename transparently.
+
+---
+
+## #64 — `batting_team AS opponent` returned player's own team instead of opponent
+
+**Symptom**
+"What were Kohli's scores against each team at Narendra Modi Stadium?" returned all rows labeled `Royal Challengers Bangalore` — Kohli's own team — as "opponent". No opposing teams appeared.
+
+**Root cause**
+The LLM generated `SELECT batting_team AS opponent` in an innings CTE. `batting_team` is the column for the batting side (Kohli's team), not the fielding/opposing team. The system prompt had a rule for filtering `bowling_team` when a single opponent is given, but no rule for the GROUP BY case when listing scores across all opponents.
+
+**Fix**
+Added a system prompt rule in `prompts.py`: "When showing a player's scores 'against each team / by opponent', GROUP BY bowling_team (the fielding team). batting_team is always the player's own team and must never be aliased as 'opponent'."
+
+---
+
+## #63 — Empty `key_takeaway` for single-winner queries ("most runs", "most wickets")
+
+**Symptom**
+Questions like "which player scored most runs post 2022" returned a single-row result with an empty `key_takeaway`, giving the user no analyst insight even though the question was substantive.
+
+**Root cause**
+`_is_rich_output()` in `insights_agent.py` returned `True` only if `len(rows) >= 2` or if the question contained terms like "top", "rank", "highest", "lowest", "compare". "Most runs" / "most wickets" / "best economy" are semantically rich but the terms "most", "best", etc. were not in the list, so single-row results from these queries were treated as simple outputs and the takeaway was suppressed.
+
+**Fix**
+Added `"most", "best", "least", "fewest", "worst", "maximum", "minimum", "average", "total", "all time", "career"` to `richness_terms` in `_is_rich_output()`.
+
+---
+
+## #62 — Follow-up chips contained "Has Virat" instead of "Virat Kohli"
+
+**Symptom**
+After answering "Has Virat Kohli played any matches at Narendra Modi Stadium?", the generated chips read "What is **Has Virat**'s highest score?" and "How many matches has **Has Virat** played?" — invalid player names.
+
+**Root cause**
+`_extract_player()` in `insights_agent.py` used `re.findall(r"\b([A-Z][a-z]+)\s+([A-Z][a-z]+)\b", ...)`, which produces non-overlapping matches. In "Has Virat Kohli...", the first match consumed `("Has", "Virat")`. Even though "Has" was checked against `_SENTENCE_STARTERS`, the consumption meant "Virat Kohli" was never found as a pair — the next pair was `("Narendra", "Modi")`, which is also not a starter, so "Narendra Modi" was returned.
+
+**Fix**
+Replaced paired `findall` with `finditer` on individual capitalized words (`\b[A-Z][a-z]+\b`). The function now iterates adjacent word pairs checking: (1) only whitespace between them, (2) first word not in `_SENTENCE_STARTERS`. This correctly skips "Has"→"Virat" (has is a starter) and finds "Virat"→"Kohli" as the first valid pair.
+
+---
+
 ## #59 — `generate_insights` and `generate_chart_spec` bypassed semaphore + circuit breaker
 
 **Symptom**

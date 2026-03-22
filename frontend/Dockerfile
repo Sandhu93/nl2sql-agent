@@ -14,10 +14,13 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 
 # NEXT_PUBLIC_* vars are inlined into the client-side JS bundle at build time.
-# Pass the backend URL as a build arg so it is correct for whatever environment
-# the image is built for (local, ngrok, production).
+# Both must be passed as build args so they are correct for the target environment.
+# NEXT_PUBLIC_BACKEND_URL — backend API base URL (required)
+# NEXT_PUBLIC_API_KEY     — API key for /api/query auth; empty = auth disabled
 ARG NEXT_PUBLIC_BACKEND_URL=http://localhost:8086
+ARG NEXT_PUBLIC_API_KEY=
 ENV NEXT_PUBLIC_BACKEND_URL=${NEXT_PUBLIC_BACKEND_URL}
+ENV NEXT_PUBLIC_API_KEY=${NEXT_PUBLIC_API_KEY}
 ENV NEXT_TELEMETRY_DISABLED=1
 RUN npm run build
 

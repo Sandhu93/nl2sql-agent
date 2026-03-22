@@ -17,6 +17,12 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    # API key authentication — Phase 16
+    # When set, every request to /api/query must include X-API-Key: <value>.
+    # When not set (default None), auth is disabled — safe for local dev.
+    # Generate a key: python -c "import secrets; print(secrets.token_hex(32))"
+    api_key: str | None = Field(default=None, description="API key for /api/query (None = auth disabled)")
+
     # OpenAI — primary LLM (required)
     openai_api_key: str = Field(..., description="OpenAI API key")
 

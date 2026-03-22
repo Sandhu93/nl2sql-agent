@@ -190,6 +190,13 @@ Returns `{"status": "ok"}` when the backend is running.
 
 ### `POST /api/query`
 
+**Headers**
+
+| Header | Required | Description |
+|--------|----------|-------------|
+| `Content-Type` | Yes | Must be `application/json` |
+| `X-API-Key` | When `API_KEY` is set | API key for authentication — see [Authentication](#authentication) |
+
 **Request body**
 
 ```json
@@ -221,12 +228,86 @@ and persists it in `localStorage` so the same session ID is reused across page r
 | Status | Cause |
 |--------|-------|
 | 400 | Question failed input validation (too long, injection detected, SQL keywords) |
+| 401 | `X-API-Key` header missing (auth is enabled but no key was sent) |
+| 403 | `X-API-Key` header present but incorrect |
 | 422 | `thread_id` is not a valid UUID v4 |
 | 429 | Per-IP rate limit exceeded (20 req/min default) or OpenAI rate limit hit |
 | 503 | LLM circuit breaker open (≥5 consecutive LLM failures — retries after 60s) |
 | 504 | Request timed out after 60s |
 
 All error responses have the shape `{"detail": "..."}`.
+
+---
+
+## Authentication
+
+The `/api/query` endpoint supports **API key authentication** (Phase 16). The `/health` endpoint is always public.
+
+### How it works
+
+When `API_KEY` is set in `.env`, every request to `/api/query` must include:
+
+```
+X-API-Key: <your-key>
+```
+
+| Condition | Result |
+|-----------|--------|
+| `API_KEY` not set | Auth disabled — all requests pass (safe default for local dev) |
+| Header missing | HTTP 401 |
+| Header present but wrong | HTTP 403 |
+| Header correct | Request proceeds normally |
+
+### Enabling auth in local Docker
+
+1. Generate a key:
+   ```bash
+   python -c "import secrets; print(secrets.token_hex(32))"
+   ```
+2. Add both to `.env`:
+   ```env
+   API_KEY=<generated-key>
+   NEXT_PUBLIC_API_KEY=<same-key>
+   ```
+3. Rebuild (required — see note below):
+   ```bash
+   docker compose up --build
+   ```
+
+> **Why `--build` is required when changing the key**
+>
+> Next.js inlines `NEXT_PUBLIC_*` variables into the client-side JavaScript bundle at **build
+> time**, not at runtime. `NEXT_PUBLIC_API_KEY` is passed as a Docker build argument and embedded
+> into the bundle during `npm run build`. Changing the value in `.env` without rebuilding leaves
+> the old (or absent) key baked into the bundle — the browser will send the wrong header.
+>
+> The backend reads `API_KEY` at startup via pydantic-settings, so a plain restart
+> (`docker compose restart backend`) is sufficient for backend-only changes, but a full
+> `--build` is the safest single command that keeps both sides in sync.
+
+### Enabling auth in production
+
+Same steps, but use your production domain in `.env`:
+
+```env
+API_KEY=<generated-key>
+NEXT_PUBLIC_API_KEY=<same-key>
+NEXT_PUBLIC_BACKEND_URL=https://your-backend-domain.com
+ALLOWED_ORIGINS=["https://your-frontend-domain.com"]
+```
+
+Then deploy:
+```bash
+docker compose up --build -d
+```
+
+**Rotating the key**: update both `API_KEY` and `NEXT_PUBLIC_API_KEY` in `.env`, then run
+`docker compose up --build`. The old key stops working immediately on backend restart; the
+frontend bundle is updated on the next client page load after the rebuild.
+
+> **Security note**: `NEXT_PUBLIC_API_KEY` is visible in the browser's JavaScript bundle — this
+> is expected for a single-tenant API key setup. If you need per-user access control, replace
+> this with JWT authentication.
 
 ---
 
@@ -321,11 +402,6 @@ invalidates and rebuilds the vector stores on next startup.
 Replace the single `fetch` call in [frontend/lib/api.ts](frontend/lib/api.ts) with a
 streaming consumer (SSE or NDJSON) and update [frontend/app/page.tsx](frontend/app/page.tsx)
 to render tokens as they arrive.
-
-### Add authentication
-
-Add an API key or JWT middleware to [backend/app/main.py](backend/app/main.py) and pass
-the corresponding `Authorization` header from `frontend/lib/api.ts`.
 
 ### Production deployment
 
