@@ -33,3 +33,8 @@ redis==5.0.4
 
 # Rate limiting — Phase 10 (production hardening): per-IP slowapi middleware
 slowapi==0.1.9
+
+# Testing — installed in Docker image so tests run via `docker compose exec backend pytest`
+pytest==8.3.5
+pytest-asyncio==0.24.0
+httpx==0.27.0          # AsyncClient for FastAPI integration tests

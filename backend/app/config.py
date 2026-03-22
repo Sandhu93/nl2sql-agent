@@ -1,6 +1,12 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field
+from pydantic import Field, field_validator
 from functools import lru_cache
+
+_VALID_EMBEDDING_MODELS = {
+    "text-embedding-3-small",
+    "text-embedding-3-large",
+    "text-embedding-ada-002",
+}
 
 
 class Settings(BaseSettings):
@@ -115,6 +121,25 @@ class Settings(BaseSettings):
         default="/app/chroma_data",
         description="Root directory for ChromaDB persistent vector stores",
     )
+
+    # Embedding model — included in content hashes so a model change auto-triggers
+    # a full re-embed of both ChromaDB stores (cricket rules + few-shot examples).
+    # Changing this value invalidates both caches on next startup.
+    # Must be one of the values in _VALID_EMBEDDING_MODELS — validated at startup
+    # to fail fast with a clear error rather than an opaque OpenAI API failure.
+    openai_embedding_model: str = Field(
+        default="text-embedding-3-small",
+        description="OpenAI embedding model used for ChromaDB vector stores",
+    )
+
+    @field_validator("openai_embedding_model")
+    @classmethod
+    def validate_embedding_model(cls, v: str) -> str:
+        if v not in _VALID_EMBEDDING_MODELS:
+            raise ValueError(
+                f"OPENAI_EMBEDDING_MODEL must be one of {sorted(_VALID_EMBEDDING_MODELS)}, got '{v}'"
+            )
+        return v
 
     # Player name index TTL — Phase 13
     # The entity resolver loads the players table once and caches it in memory.

@@ -60,8 +60,16 @@ _vectorstore: Chroma | None = None
 
 
 def _content_hash() -> str:
-    """SHA-256 of the cricket_rules.md source file."""
-    return hashlib.sha256(_RULES_PATH.read_bytes()).hexdigest()
+    """SHA-256 of cricket_rules.md content + embedding model name.
+
+    Including the model name ensures that switching embedding models
+    (e.g. ada-002 → text-embedding-3-small) invalidates the on-disk store
+    and triggers a full re-embed, preventing silently stale vectors.
+    """
+    h = hashlib.sha256()
+    h.update(_RULES_PATH.read_bytes())
+    h.update(settings.openai_embedding_model.encode())
+    return h.hexdigest()
 
 
 def _is_cache_valid(chroma_dir: Path) -> bool:
@@ -127,7 +135,10 @@ def _get_vectorstore() -> Chroma:
 
     chroma_dir = Path(settings.chroma_persist_dir) / "cricket_rules"
     chroma_dir.mkdir(parents=True, exist_ok=True)
-    embeddings = OpenAIEmbeddings(api_key=settings.openai_api_key)
+    embeddings = OpenAIEmbeddings(
+        api_key=settings.openai_api_key,
+        model=settings.openai_embedding_model,
+    )
 
     if _is_cache_valid(chroma_dir):
         # Fast path: load from disk — no embeddings API call required.
@@ -157,9 +168,10 @@ def _get_vectorstore() -> Chroma:
         # Write hash so next cold start skips re-embedding.
         (chroma_dir / _HASH_FILE_NAME).write_text(_content_hash())
         logger.info(
-            "Cricket rules vector store built and persisted | dir=%s | chunks=%d",
+            "Cricket rules vector store built and persisted | dir=%s | chunks=%d | model=%s",
             chroma_dir,
             len(chunks),
+            settings.openai_embedding_model,
         )
     return _vectorstore
 

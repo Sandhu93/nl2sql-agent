@@ -30,7 +30,7 @@ services:
     image: redis:7-alpine
     container_name: nl2sql_redis
     ports:
-      - "6379:6379"
+      - "6380:6379"   # host 6380 → container 6379 (avoids conflict with other Redis instances)
     volumes:
       - redis_data:/data
     command: >
@@ -99,6 +99,9 @@ services:
     volumes:
       # Hot-reload: mount source code so uvicorn --reload picks up changes.
       - ./backend/app:/app/app
+      # Tests and pytest config — mounted so changes are reflected without rebuild.
+      - ./backend/tests:/app/tests
+      - ./backend/pytest.ini:/app/pytest.ini
       # Persistent ChromaDB vector stores — Phase 13.
       # Survives container restarts so embeddings are not recomputed on every
       # cold start.  To force a full re-embed, run:

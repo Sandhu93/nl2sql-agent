@@ -1255,3 +1255,75 @@ expiry check and no public refresh API.
 - Load failure leaves `_INDEX_LOADED_AT = None` so the next request retries.
 - `config.py` — added `player_index_ttl_seconds` (default 3600).
 - `.env.example` — documented `PLAYER_INDEX_TTL_SECONDS` override.
+
+---
+
+## Phase 13 — ChromaDB Disk Persistence + Entity Resolver TTL + Embedding Versioning
+
+**Goal:** Eliminate re-embedding on cold start; add TTL refresh for player name cache; guarantee correct vector search when embedding model changes.
+
+### What was built (Phase 13 extension, 2026-03-22)
+
+**Embedding versioning — Fix for bug #39 (silent cache miss)**
+
+| Component | Before | After |
+|---|---|---|
+| Content hash for `cricket_rules` vectors | SHA-256 of file bytes only | SHA-256 of (file bytes + `settings.openai_embedding_model`) |
+| Content hash for few-shot examples vectors | SHA-256 of `IPL_EXAMPLES` JSON only | SHA-256 of (JSON + `settings.openai_embedding_model`) |
+| Embedding model configuration | Hardcoded in code | `openai_embedding_model: str` in `config.py`, settable via `OPENAI_EMBEDDING_MODEL` env var |
+
+**Root cause fixed**
+
+ChromaDB hashes did not include the embedding model name. If `OPENAI_EMBEDDING_MODEL` changed at runtime (e.g. `text-embedding-ada-002` → `text-embedding-3-small`), the hash would stay the same and stale vectors trained on the old model would silently serve wrong results. This was the most dangerous silent failure in the pipeline — incorrect retrieval with no warning.
+
+**Changes made**
+
+### Fix 1 — `config.py`
+Added `openai_embedding_model: str = Field(default="text-embedding-3-small", ...)` as the canonical single source of truth for embedding model selection. All code reads from this field, not hardcoded strings.
+
+### Fix 2 — `cricket_knowledge.py`
+Updated `_content_hash()` to include the embedding model:
+```python
+# Before
+content_hash = hashlib.sha256(cricket_rules_bytes).hexdigest()
+
+# After — hash includes the model name
+model_bytes = settings.openai_embedding_model.encode()
+content_hash = hashlib.sha256(cricket_rules_bytes + model_bytes).hexdigest()
+```
+
+Updated `OpenAIEmbeddings(...)` initialization to use the configured model:
+```python
+embeddings = OpenAIEmbeddings(model=settings.openai_embedding_model)
+```
+
+### Fix 3 — `prompts.py`
+Updated `_get_few_shot_selector()` hash to include the embedding model:
+```python
+# Before
+examples_hash = hashlib.sha256(json.dumps(IPL_EXAMPLES).encode()).hexdigest()
+
+# After — hash includes the model name
+model_bytes = settings.openai_embedding_model.encode()
+examples_hash = hashlib.sha256(
+    json.dumps(IPL_EXAMPLES).encode() + model_bytes
+).hexdigest()
+```
+
+Updated `OpenAIEmbeddings(...)` initialization:
+```python
+embeddings = OpenAIEmbeddings(model=settings.openai_embedding_model)
+```
+
+### Fix 4 — `.env.example`
+Added `OPENAI_EMBEDDING_MODEL=text-embedding-3-small` (commented out with explanation) so developers can override the default if needed.
+
+**Result**
+
+Changing `OPENAI_EMBEDDING_MODEL` now automatically invalidates both ChromaDB collections on the next request. Old vectors are wiped and new vectors are re-embedded using the new model. No silent retrieval failures.
+
+### Bugs fixed
+
+| # | Bug | Fix |
+|---|---|---|
+| #39 | Embedding model change silent cache miss — stale vectors served without warning | Versioning via `openai_embedding_model` included in content hash |

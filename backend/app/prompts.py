@@ -509,10 +509,13 @@ def _get_few_shot_selector(
     persist_dir = Path(settings.chroma_persist_dir) / "few_shot"
     persist_dir.mkdir(parents=True, exist_ok=True)
 
-    # Stable hash of the full IPL_EXAMPLES list.
-    examples_hash = hashlib.sha256(
-        json.dumps(IPL_EXAMPLES, sort_keys=True).encode()
-    ).hexdigest()
+    # Stable hash of the full IPL_EXAMPLES list + embedding model name.
+    # Including the model name ensures a model change triggers a full re-embed
+    # rather than silently serving stale vectors from the previous model.
+    h = hashlib.sha256()
+    h.update(json.dumps(IPL_EXAMPLES, sort_keys=True).encode())
+    h.update(settings.openai_embedding_model.encode())
+    examples_hash = h.hexdigest()
     hash_file = persist_dir / _HASH_FILE_NAME
 
     has_data = any(f.name != _HASH_FILE_NAME for f in persist_dir.iterdir())
@@ -559,9 +562,10 @@ def _get_few_shot_selector(
     )
     hash_file.write_text(examples_hash)
     logger.info(
-        "Few-shot selector built and persisted | dir=%s | examples=%d",
+        "Few-shot selector built and persisted | dir=%s | examples=%d | model=%s",
         persist_dir,
         len(IPL_EXAMPLES),
+        settings.openai_embedding_model,
     )
     return selector
 
@@ -598,7 +602,10 @@ def _build_few_shot_prompt() -> ChatPromptTemplate:
     # incoming question embedding and each stored example, then returns the
     # k=3 closest matches.  The vector store is persisted so embeddings are
     # not recomputed on every cold start.
-    embeddings = OpenAIEmbeddings(api_key=settings.openai_api_key)
+    embeddings = OpenAIEmbeddings(
+        api_key=settings.openai_api_key,
+        model=settings.openai_embedding_model,
+    )
     example_selector = _get_few_shot_selector(embeddings)
     logger.info("Dynamic example selector ready | examples=%d | k=3", len(IPL_EXAMPLES))
 
