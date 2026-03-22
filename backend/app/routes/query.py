@@ -1,13 +1,15 @@
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 from typing import Any
+import json
 import uuid
 import logging
 
 import asyncio
 from openai import RateLimitError
 
-from app.agent import run_agent, LLMCircuitOpenError
+from app.agent import run_agent, run_agent_stream, LLMCircuitOpenError
 from app.config import get_settings
 from app.input_validator import validate_question
 from app.limiter import limiter
@@ -161,3 +163,73 @@ async def query_endpoint(
         insights=result.get("insights"),
         chart_spec=result.get("chart_spec"),
     )
+
+
+@router.post(
+    "/query/stream",
+    summary="Run NL2SQL agent (streaming NDJSON)",
+    description=(
+        "Streams step-level NDJSON events as each pipeline milestone completes:\n"
+        "  sql_ready → answer_ready → insights_ready → chart_ready\n\n"
+        "HTTP status is always 200 once streaming starts; errors mid-stream are "
+        "delivered as {\"type\": \"error\", \"error\": \"...\"}  events."
+    ),
+)
+@limiter.limit(f"{settings.rate_limit_per_minute}/minute")
+async def query_stream_endpoint(
+    request: Request,
+    body: QueryRequest,
+    _: None = Depends(verify_api_key),
+) -> StreamingResponse:
+    """
+    POST /api/query/stream
+
+    Same auth, rate limiting, and input validation as /api/query, but yields
+    results incrementally so the frontend can display SQL (~1 s) before the
+    full answer arrives (~3–5 s total).
+
+    TODO: Add per-request timeout by wrapping the generator in an asyncio
+          task with a deadline if needed for the streaming path.
+    """
+    logger.info(
+        "POST /api/query/stream | thread_id=%s | ip=%s",
+        body.thread_id,
+        request.client.host if request.client else "unknown",
+    )
+
+    # Layer 1 — Input validation (same as the JSON endpoint).
+    # Must happen before streaming starts so we can still return HTTP 400.
+    try:
+        question = validate_question(body.question)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
+    async def _event_generator():
+        """Wrap run_agent_stream; convert exceptions to error events."""
+        try:
+            async for event_line in run_agent_stream(question=question, thread_id=body.thread_id):
+                yield event_line
+        except LLMCircuitOpenError as exc:
+            logger.warning("LLM circuit open | thread_id=%s: %s", body.thread_id, exc)
+            yield json.dumps({"type": "error", "error": str(exc)}) + "\n"
+        except RateLimitError as exc:
+            logger.warning("Rate limit hit | thread_id=%s: %s", body.thread_id, exc)
+            yield json.dumps({"type": "error", "error": "LLM rate limit exceeded. Please wait a moment and try again."}) + "\n"
+        except Exception as exc:
+            logger.exception("Stream error for thread_id=%s", body.thread_id)
+            yield json.dumps({"type": "error", "error": "An error occurred while processing your request."}) + "\n"
+
+    async def _generate():
+        """Yield event lines; stop early on client disconnect."""
+        async for chunk in _event_generator():
+            # TODO: request.is_disconnected() requires starlette >= 0.20.
+            #       Enable this guard once the minimum version is confirmed.
+            # if await request.is_disconnected():
+            #     logger.info("Client disconnected | thread_id=%s", body.thread_id)
+            #     break
+            yield chunk
+
+    return StreamingResponse(_generate(), media_type="application/x-ndjson")

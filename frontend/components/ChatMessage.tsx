@@ -32,6 +32,11 @@ export interface Message {
    */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   chart_spec?: Record<string, any> | null;
+  /**
+   * Streaming — true while the answer is still arriving (sql_ready received
+   * but answer_ready not yet).  Shows a "..." placeholder in the bubble.
+   */
+  pending?: boolean;
 }
 
 interface ChatMessageProps {
@@ -56,7 +61,7 @@ export default function ChatMessage({ message, onChipClick }: ChatMessageProps) 
         }`}
       >
         <p className="text-sm leading-relaxed whitespace-pre-wrap break-words">
-          {message.content}
+          {message.content || (message.pending ? "..." : "")}
         </p>
 
         {/* SQL block — existing */}

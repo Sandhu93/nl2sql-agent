@@ -719,42 +719,27 @@ async def _maybe_summarize_history(
         return msgs[-_SUMMARY_THRESHOLD:]  # fallback: plain sliding window
 
 
-async def run_agent(question: str, thread_id: str) -> dict[str, str]:
+async def run_agent_stream(question: str, thread_id: str):
     """
-    Execute the NL2SQL pipeline with natural-language rephrasing.
+    Streaming NL2SQL pipeline — async generator that yields NDJSON event lines.
 
-    Pipeline:
-        0. query_rewrite   — rewrite ambiguous follow-ups into standalone questions
-                             (skipped on the first turn when history is empty)
-        1. select_table    — LLM picks relevant tables from descriptions CSV
-        2. generate_query  — NL → raw LLM output (only relevant schemas shown;
-                             conversation history injected via MessagesPlaceholder)
-        3. _clean_sql()    — extract pure SQL statements
-        4. _run_sql()      — execute each statement, combine results
-        5. rephrase_answer — (question + SQL + result) → readable sentence
+    Yields one newline-terminated JSON object per pipeline milestone:
+      {"type": "sql_ready",      "sql":        "SELECT ..."}
+      {"type": "answer_ready",   "answer":     "..."}
+      {"type": "insights_ready", "insights":   {"key_takeaway": ..., "follow_up_chips": [...]}}
+      {"type": "chart_ready",    "chart_spec": {...}}   # only when viz was requested
 
-    Args:
-        question:  Natural-language question from the user.
-        thread_id: Session identifier — used to look up / create the
-                   per-thread ChatMessageHistory so follow-up questions
-                   can reference earlier answers in the same session.
+    Early exits (SQL validation failure, empty result, SQL execution error) yield
+    sql_ready + answer_ready with an appropriate message, then stop.
 
-    Returns:
-        {
-            "answer":     natural language sentence,
-            "sql":        clean SQL string,
-            "insights":   {"key_takeaway": str, "follow_up_chips": list[str]},
-            "chart_spec": Vega-Lite spec dict or None (only when viz was requested),
-        }
+    Exceptions raised before sql_ready (e.g. LLMCircuitOpenError during
+    query rewrite or table selection) propagate unchanged to the caller so
+    the streaming route can catch them and emit a final error event.
     """
-    logger.info("run_agent | thread_id=%s | question=%r", thread_id, question)
+    logger.info("run_agent_stream | thread_id=%s | question=%r", thread_id, question)
 
     generate_query, execute_query, rephrase_answer, select_table, rewrite_query = _get_chain()
 
-    # Retrieve the conversation history for this session.
-    # RedisChatMessageHistory creates the key lazily on first write, so a new
-    # thread_id with no prior messages simply starts with an empty list.
-    # history.messages is [] on the first turn — MessagesPlaceholder adds nothing.
     history = _get_history(thread_id)
     is_first_turn = not bool(history.messages)
     logger.info(
@@ -764,48 +749,33 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
         len(history.messages) // 2,
     )
 
-    # Cache lookup — only for first-turn questions (follow-up answers are
-    # thread-specific and must never be served from a shared cache).
-    # On a hit we still update history so the next follow-up has context.
+    # Cache lookup — only for first-turn questions.
+    # On a hit, yield all cached events immediately and return.
     if is_first_turn and _redis_available and _redis_client:
         try:
             cached_raw = _redis_client.get(_cache_key(question))
             if cached_raw:
-                cached_result = json.loads(cached_raw)
+                cached = json.loads(cached_raw)
                 logger.info("Cache hit | thread_id=%s | question=%r", thread_id, question)
                 history.add_user_message(question)
-                history.add_ai_message(cached_result.get("answer", ""))
-                return cached_result
+                history.add_ai_message(cached.get("answer", ""))
+                yield json.dumps({"type": "sql_ready", "sql": cached.get("sql", "")}) + "\n"
+                yield json.dumps({"type": "answer_ready", "answer": cached.get("answer", "")}) + "\n"
+                if cached.get("insights"):
+                    yield json.dumps({"type": "insights_ready", "insights": cached["insights"]}) + "\n"
+                if cached.get("chart_spec"):
+                    yield json.dumps({"type": "chart_ready", "chart_spec": cached["chart_spec"]}) + "\n"
+                return
         except Exception as exc:
             logger.warning("Cache lookup failed (non-blocking): %s", exc)
 
-    # Step 0 — Rewrite follow-up questions into fully standalone queries.
-    # The table-selector (Step 1) has no access to conversation history, so an
-    # ambiguous follow-up like "What about 2020?" or "Show me their top scorers"
-    # would cause it to pick wrong tables or nothing at all.  By rewriting the
-    # question into a self-contained form first, every downstream step receives
-    # an unambiguous question without needing to be aware of the history.
-    #
-    # On the first turn (empty history) we skip the LLM call entirely — there
-    # is nothing to resolve and we save one round-trip.
+    # Step 0 — Rewrite follow-up questions into standalone queries.
     if history.messages:
-        # Build the rewrite context: summarize old turns when the thread is
-        # long so the rewrite chain has compact but accurate context rather
-        # than a hard-truncated window that loses early topics.
         rewrite_history = await _maybe_summarize_history(history)
         standalone_question: str = await _llm_invoke(rewrite_query, {
             "history": rewrite_history,
             "question": question,
         })
-        # Safety guard: discard the rewrite if the LLM answered the question
-        # instead of rewriting it.
-        #
-        # The "?" check is the reliable signal: hallucinated answers are statements,
-        # not questions. A length ratio (e.g. 3×, 5×) is the wrong tool — short
-        # follow-ups like "plot" or "you forgot to plot" legitimately expand into
-        # full standalone questions that exceed any fixed multiplier.
-        # We keep only a generous absolute ceiling (300 chars) to reject the rare
-        # case where the LLM emits a multi-sentence paragraph as a single "question".
         _looks_like_answer = (
             not standalone_question.strip().endswith("?")
             or len(standalone_question) > 300
@@ -821,44 +791,27 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
             question, standalone_question,
         )
     else:
-        standalone_question = question  # first turn — nothing to resolve
+        standalone_question = question
 
-    # Step 0b — Resolve entity aliases (e.g. full player names) into dataset
-    # names so SQL generation can match the underlying schema reliably.
+    # Step 0b — Entity resolution.
     resolved_question, player_name_mappings = resolve_player_mentions(standalone_question)
     if player_name_mappings:
         logger.info("Player name mappings applied: %s", player_name_mappings)
 
-    # Steps 1 + 1b — Run table selection and cricket knowledge retrieval in
-    # parallel. Both are independent of each other: table selection makes one
-    # LLM API call; cricket retrieval makes one embedding API call + in-memory
-    # vector search. Running them concurrently saves ~300–500 ms per request.
-    #
-    # TODO: If the cricket vector store is not yet initialised when the first
-    #       request arrives, its cold-start embedding call also runs here,
-    #       hidden inside asyncio.gather. That is intentional — the user's first
-    #       question absorbs the one-time cost transparently.
+    # Steps 1 + 1b — Table selection + cricket RAG (parallel).
     available_tables = set(_db.get_usable_table_names())
     raw_selection, cricket_context = await asyncio.gather(
         _llm_invoke(select_table, {"question": resolved_question}),
         retrieve_cricket_rules(resolved_question, k=3),
     )
 
-    # Step 1 — Validate table selection; fall back to all tables if needed.
-    # Discard hallucinated names; keep only tables that actually exist in the DB.
     table_names = [t for t in raw_selection if t in available_tables]
     if not table_names:
         table_names = list(available_tables)
         logger.warning("Table selector returned no valid tables; falling back to all: %s", table_names)
     logger.info("Tables selected: %s", table_names)
 
-    # Step 2 — Generate SQL using the selected tables' schemas + cricket context.
-    # {cricket_context} carries the k=3 most relevant sections from
-    # cricket_rules.md (e.g. bowling rules, eligibility rules, dismissal logic)
-    # so the LLM generates cricket-correct SQL, not just schema-correct SQL.
-    # We intentionally do NOT pass full chat history to SQL generation.
-    # Follow-up references are already resolved in Step 0 (rewrite), and
-    # long message history causes factual drift/hallucination in later turns.
+    # Step 2 — SQL generation.
     raw: str = await _llm_invoke(generate_query, {
         "question": resolved_question,
         "table_names_to_use": table_names,
@@ -867,15 +820,11 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
     })
     logger.info("Raw LLM output: %s", raw)
 
-    # Step 3 — Extract clean SQL from whatever the LLM returned.
+    # Step 3 — Clean SQL.
     sql = _clean_sql(raw)
     logger.info("Cleaned SQL: %s", sql)
 
-    # Layer 2 — SQL output validation: block any non-SELECT statement before
-    # it reaches the database.  This is a defence-in-depth check — even if
-    # prompt injection or a model error causes the LLM to emit a destructive
-    # statement, it is stopped here.  Returns a safe answer to the user and
-    # skips execution entirely.
+    # Layer 2 — SQL output validation.
     try:
         validate_sql(sql)
     except ValueError as exc:
@@ -889,10 +838,11 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
         )
         history.add_user_message(question)
         history.add_ai_message(answer)
-        return {"answer": answer, "sql": sql, "insights": None, "chart_spec": None}
+        yield json.dumps({"type": "sql_ready", "sql": sql}) + "\n"
+        yield json.dumps({"type": "answer_ready", "answer": answer}) + "\n"
+        return
 
-    # Layer 2b — semantic SQL validation for high-confidence logical errors
-    # that are syntactically valid but produce wrong/empty results.
+    # Layer 2b — Semantic SQL validation.
     semantic_issue = detect_semantic_sql_issue(sql)
     semantic_attempts = 0
     while semantic_issue and semantic_attempts < _MAX_SQL_RETRIES:
@@ -925,13 +875,12 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
         )
         history.add_user_message(question)
         history.add_ai_message(answer)
-        return {"answer": answer, "sql": sql, "insights": None, "chart_spec": None}
+        yield json.dumps({"type": "sql_ready", "sql": sql}) + "\n"
+        yield json.dumps({"type": "answer_ready", "answer": answer}) + "\n"
+        return
 
     # Step 4 — Execute with automatic error correction on failure.
-    # IMPORTANT: QuerySQLDataBaseTool never raises on SQL errors — it returns
-    # the psycopg2 exception as a plain string starting with "Error:".
-    # We detect that pattern with _is_sql_error() and drive the retry loop on
-    # it, rather than relying on try/except which would never trigger.
+    # IMPORTANT: QuerySQLDataBaseTool returns errors as strings, not exceptions.
     sql_to_run = sql
     result: str = ""
     for attempt in range(1 + _MAX_SQL_RETRIES):
@@ -941,7 +890,7 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
             result = f"Error: {exc}"
 
         if not _is_sql_error(result):
-            sql = sql_to_run  # keep the (possibly corrected) SQL for the response
+            sql = sql_to_run
             break
 
         if attempt == _MAX_SQL_RETRIES:
@@ -957,16 +906,17 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
         logger.info("Corrected SQL (attempt %d): %s", attempt + 2, sql_to_run)
     logger.info("Query result: %s", result)
 
-    # Step 5 — Rephrase the raw DB result into a natural language answer.
-    # Guard: if the query ran without error but returned no rows, skip the
-    # rephrase chain (it would hallucinate a confusing non-answer) and tell
-    # the user directly so they know to refine the question.
+    # Yield SQL immediately so the client can display it while answer/insights load.
+    yield json.dumps({"type": "sql_ready", "sql": sql}) + "\n"
+
+    # Handle error/empty result early exits.
     if _is_sql_error(result):
         answer = f"The query could not be executed after {_MAX_SQL_RETRIES} correction attempts. Last error: {result}"
         logger.warning("Returning error answer | thread_id=%s", thread_id)
         history.add_user_message(question)
         history.add_ai_message(answer)
-        return {"answer": answer, "sql": sql, "insights": None, "chart_spec": None}
+        yield json.dumps({"type": "answer_ready", "answer": answer}) + "\n"
+        return
 
     if not result or not result.strip():
         answer = (
@@ -977,59 +927,74 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
         logger.warning("Empty query result | thread_id=%s | sql=%s", thread_id, sql)
         history.add_user_message(question)
         history.add_ai_message(answer)
-        return {"answer": answer, "sql": sql, "insights": None, "chart_spec": None}
+        yield json.dumps({"type": "answer_ready", "answer": answer}) + "\n"
+        return
 
-    # Steps 5a + 5b + 5c — run in parallel to hide LLM latency:
-    #   5a. rephrase_answer  — convert raw DB rows into a natural language sentence
-    #   5b. generate_insights — key takeaway + 3 follow-up question chips (Phase 8)
-    #   5c. generate_chart_spec — Vega-Lite spec if user asked for a chart (Phase 9)
-    #
-    # TODO: If insights or viz add too much latency, gate them behind
-    #       ENABLE_INSIGHTS / ENABLE_VIZ config flags in config.py.
-    # Check both the original question and the rewritten standalone question because
-    # the query rewriter may strip chart-related keywords (e.g. "show me a bar chart"
-    # → "Who were the top 10 run scorers?"), causing viz intent to be silently lost.
+    # Steps 5a/5b/5c — run in parallel, yield each event as it completes.
+    # viz_requested is computed here (after step 0) because standalone_question
+    # is not known until after the rewrite step.
     viz_requested = wants_visualization(question) or wants_visualization(standalone_question)
     recent_chips = _get_recent_chips(thread_id)
 
-    async def _maybe_chart() -> dict | None:
-        """Run chart spec generation only when the question asks for a viz."""
+    async def _maybe_chart_inner() -> dict | None:
         if not viz_requested:
             return None
-        # invoke_fn routes the intent-extraction LLM call through the semaphore
-        # and circuit breaker alongside all other LLM calls in this pipeline.
         return await generate_chart_spec(standalone_question, result, _fast_llm, invoke_fn=_llm_invoke)
 
-    # All three parallel steps now route their LLM calls through _llm_invoke so
-    # the concurrency semaphore and circuit breaker cover every LLM call site.
-    answer, insights, chart_spec = await asyncio.gather(
-        _llm_invoke(rephrase_answer, {
+    async def _run_tagged(tag: str, key: str, coro):
+        """Wrap a coroutine with a (tag, key) label for use with as_completed."""
+        try:
+            value = await coro
+        except Exception as exc:
+            logger.warning("Streaming step %s failed (non-blocking): %s", tag, exc)
+            value = None
+        return tag, key, value
+
+    step5_awaitables = [
+        _run_tagged("answer_ready", "answer", _llm_invoke(rephrase_answer, {
             "question": standalone_question,
             "query": sql,
             "result": result,
-        }),
-        generate_insights(standalone_question, result, _fast_llm, recent_chips=recent_chips, invoke_fn=_llm_invoke),
-        _maybe_chart(),
-    )
+        })),
+        _run_tagged("insights_ready", "insights", generate_insights(
+            standalone_question, result, _fast_llm,
+            recent_chips=recent_chips, invoke_fn=_llm_invoke,
+        )),
+    ]
+    if viz_requested:
+        step5_awaitables.append(
+            _run_tagged("chart_ready", "chart_spec", _maybe_chart_inner())
+        )
+
+    collected: dict = {}
+    for fut in asyncio.as_completed(step5_awaitables):
+        event_type, key, value = await fut
+        collected[key] = value
+        yield json.dumps({"type": event_type, key: value}, default=str) + "\n"
+
+    answer = collected.get("answer") or ""
+    insights = collected.get("insights") or {"key_takeaway": "", "follow_up_chips": []}
+    chart_spec = collected.get("chart_spec")
+
     logger.info("Rephrased answer: %s", answer)
+    insights_dict = insights if isinstance(insights, dict) else {}
     logger.info(
         "Insights generated | key_takeaway=%r | chips=%d",
-        insights.get("key_takeaway", "")[:60],
-        len(insights.get("follow_up_chips", [])),
+        str(insights_dict.get("key_takeaway", ""))[:60],
+        len(insights_dict.get("follow_up_chips", [])),
     )
     if chart_spec:
         logger.info("Chart spec generated | viz_requested=%s", viz_requested)
 
-    # Update recent chips memory (last 2 turns ~= 6 chips max) for dedupe.
-    chips = insights.get("follow_up_chips", []) if isinstance(insights, dict) else []
+    # Update recent chips memory for cross-turn dedupe.
+    chips = insights_dict.get("follow_up_chips", [])
     merged_recent: list[str] = []
     for chip in [*recent_chips, *chips]:
         if chip and chip not in merged_recent:
             merged_recent.append(chip)
     _set_recent_chips(thread_id, merged_recent[-6:])
 
-    # Update conversation history so the next turn in this session can
-    # reference what was asked and answered here.
+    # Update conversation history.
     history.add_user_message(question)
     history.add_ai_message(answer)
     logger.info(
@@ -1038,11 +1003,8 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
         len(history.messages) // 2,
     )
 
-    result_payload = {"answer": answer, "sql": sql, "insights": insights, "chart_spec": chart_spec}
-
     # Cache write — only for first-turn questions.
-    # Follow-up answers depend on thread history and must NOT be cached globally.
-    # TODO: add a cache invalidation hook here if the underlying DB data changes.
+    result_payload = {"answer": answer, "sql": sql, "insights": insights, "chart_spec": chart_spec}
     if is_first_turn and _redis_available and _redis_client:
         try:
             _redis_client.set(
@@ -1054,4 +1016,34 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
         except Exception as exc:
             logger.warning("Cache write failed (non-blocking): %s", exc)
 
-    return result_payload
+
+async def run_agent(question: str, thread_id: str) -> dict[str, str]:
+    """
+    Execute the NL2SQL pipeline. Returns the complete result dict.
+
+    Delegates to run_agent_stream() and collects all events into the same
+    dict shape that was returned before streaming was introduced.  Existing
+    callers (routes/query.py JSON endpoint, integration tests) are unchanged.
+
+    Returns:
+        {
+            "answer":     natural language sentence,
+            "sql":        clean SQL string,
+            "insights":   {"key_takeaway": str, "follow_up_chips": list[str]},
+            "chart_spec": Vega-Lite spec dict or None,
+        }
+    """
+    result: dict = {"answer": "", "sql": "", "insights": None, "chart_spec": None}
+    async for line in run_agent_stream(question, thread_id):
+        event = json.loads(line)
+        t = event.get("type")
+        if t == "sql_ready":
+            result["sql"] = event.get("sql", "")
+        elif t == "answer_ready":
+            result["answer"] = event.get("answer", "")
+        elif t == "insights_ready":
+            result["insights"] = event.get("insights")
+        elif t == "chart_ready":
+            result["chart_spec"] = event.get("chart_spec")
+    return result
+

@@ -2,7 +2,7 @@
 
 import { useState, useRef, useEffect, FormEvent, useCallback } from "react";
 import ChatMessage, { Message } from "@/components/ChatMessage";
-import { queryAgent } from "@/lib/api";
+import { queryAgentStream } from "@/lib/api";
 
 /**
  * Main chat page — NL2SQL Agent interface.
@@ -77,25 +77,53 @@ export default function ChatPage() {
       setError(null);
       setLoading(true);
 
+      // Stable ID for the assistant message so we can update it in place
+      // as streaming events arrive (sql_ready → answer_ready → insights_ready).
+      const assistantId = crypto.randomUUID();
+
       try {
-        // TODO: Replace with streaming once the backend supports SSE.
-        const response = await queryAgent({
+        for await (const event of queryAgentStream({
           question: question.trim(),
           thread_id: threadId,
-        });
-
-        const assistantMessage: Message = {
-          id: crypto.randomUUID(),
-          role: "assistant",
-          content: response.answer,
-          sql: response.sql,
-          // Phase 8 — insights
-          insights: response.insights,
-          // Phase 9 — chart spec (null when not a viz request)
-          chart_spec: response.chart_spec,
-        };
-
-        setMessages((prev) => [...prev, assistantMessage]);
+        })) {
+          if (event.type === "sql_ready") {
+            // SQL is ready — add the assistant bubble immediately and hide
+            // the loading dots so the user sees SQL while the answer generates.
+            setMessages((prev) => [
+              ...prev,
+              {
+                id: assistantId,
+                role: "assistant",
+                content: "",
+                sql: event.sql,
+                pending: true,
+              },
+            ]);
+            setLoading(false);
+          } else if (event.type === "answer_ready") {
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === assistantId
+                  ? { ...m, content: event.answer, pending: false }
+                  : m
+              )
+            );
+          } else if (event.type === "insights_ready") {
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === assistantId ? { ...m, insights: event.insights } : m
+              )
+            );
+          } else if (event.type === "chart_ready") {
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === assistantId
+                  ? { ...m, chart_spec: event.chart_spec }
+                  : m
+              )
+            );
+          }
+        }
       } catch (err) {
         const message =
           err instanceof Error ? err.message : "An unexpected error occurred.";

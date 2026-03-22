@@ -80,9 +80,9 @@ import "@testing-library/jest-dom";
 // Module mocks — must be declared before imports so jest.mock hoisting works
 // ---------------------------------------------------------------------------
 
-// Mock queryAgent to avoid real network calls
+// Mock queryAgentStream to avoid real network calls
 jest.mock("@/lib/api", () => ({
-  queryAgent: jest.fn(),
+  queryAgentStream: jest.fn(),
 }));
 
 // Mock child components that have their own complex deps (vega-embed, etc.)
@@ -107,9 +107,40 @@ jest.mock("@/components/ChatMessage", () => {
 // ---------------------------------------------------------------------------
 
 import ChatPage from "@/app/page";
-import { queryAgent } from "@/lib/api";
+import { queryAgentStream } from "@/lib/api";
+import type { StreamEvent } from "@/lib/api";
 
-const mockQueryAgent = queryAgent as jest.MockedFunction<typeof queryAgent>;
+const mockQueryAgentStream = queryAgentStream as jest.MockedFunction<typeof queryAgentStream>;
+
+/** Build an async generator that yields the given StreamEvent objects. */
+async function* makeStream(events: StreamEvent[]): AsyncGenerator<StreamEvent> {
+  for (const event of events) {
+    yield event;
+  }
+}
+
+/** Async generator that immediately throws an Error with the given message. */
+async function* makeErrorStream(message: string): AsyncGenerator<StreamEvent> {
+  throw new Error(message);
+}
+
+/** Default success stream: sql_ready → answer_ready → insights_ready */
+function defaultStream() {
+  return makeStream([
+    {
+      type: "sql_ready",
+      sql: "SELECT batsman, SUM(batsman_runs) FROM deliveries GROUP BY batsman ORDER BY 2 DESC LIMIT 1;",
+    },
+    { type: "answer_ready", answer: "Virat Kohli scored the most runs." },
+    {
+      type: "insights_ready",
+      insights: {
+        key_takeaway: "Kohli leads by a significant margin.",
+        follow_up_chips: ["How many centuries did Kohli score?", "Who is second?"],
+      },
+    },
+  ]);
+}
 
 // ---------------------------------------------------------------------------
 // Deterministic UUID helper
@@ -133,18 +164,14 @@ beforeEach(() => {
   localStorage.clear();
   // Reset UUID counter
   _uuidCounter = 0;
-  // Reset all mocks
+  // Clear mock call counts and restore any lingering spies (e.g. crypto.randomUUID).
+  // restoreAllMocks is required because several handleNewSession tests spy on
+  // crypto.randomUUID without calling mockRestore(), and a leaked spy causes the
+  // user-message id and assistantId to collide in the streaming submission tests.
+  jest.restoreAllMocks();
   jest.clearAllMocks();
-  // Default: queryAgent resolves successfully
-  mockQueryAgent.mockResolvedValue({
-    answer: "Virat Kohli scored the most runs.",
-    sql: "SELECT batsman, SUM(batsman_runs) FROM deliveries GROUP BY batsman ORDER BY 2 DESC LIMIT 1;",
-    insights: {
-      key_takeaway: "Kohli leads by a significant margin.",
-      follow_up_chips: ["How many centuries did Kohli score?", "Who is second?"],
-    },
-    chart_spec: null,
-  });
+  // Default: streaming succeeds with sql_ready → answer_ready → insights_ready
+  mockQueryAgentStream.mockImplementation(defaultStream);
 });
 
 // ---------------------------------------------------------------------------
@@ -261,7 +288,7 @@ describe("submitQuestion hydration guard", () => {
     await userEvent.click(submitButton);
 
     await waitFor(() => {
-      expect(mockQueryAgent).toHaveBeenCalledWith({
+      expect(mockQueryAgentStream).toHaveBeenCalledWith({
         question: "Who scored the most runs?",
         thread_id: threadId,
       });
@@ -313,7 +340,7 @@ describe("handleNewSession", () => {
 
     // Wait for the assistant message to appear
     await waitFor(() => {
-      expect(mockQueryAgent).toHaveBeenCalled();
+      expect(mockQueryAgentStream).toHaveBeenCalled();
     });
     await waitFor(() => {
       expect(screen.queryAllByTestId("message-user").length).toBeGreaterThan(0);
@@ -357,8 +384,8 @@ describe("handleNewSession", () => {
     const threadId = "thread-clear-error";
     localStorage.setItem(THREAD_ID_KEY, threadId);
 
-    // Make queryAgent fail to trigger an error
-    mockQueryAgent.mockRejectedValueOnce(new Error("Server error"));
+    // Make queryAgentStream fail to trigger an error
+    mockQueryAgentStream.mockImplementationOnce(() => makeErrorStream("Server error"));
 
     render(<ChatPage />);
     await act(async () => {});
@@ -412,21 +439,16 @@ describe("full submission flow (happy path)", () => {
     const threadId = "submit-flow-thread";
     localStorage.setItem(THREAD_ID_KEY, threadId);
 
-    // Delay the API response so we can assert the user message appears first
-    mockQueryAgent.mockImplementation(
-      () =>
-        new Promise((resolve) =>
-          setTimeout(
-            () =>
-              resolve({
-                answer: "Mumbai Indians won the most.",
-                sql: "SELECT winner FROM matches GROUP BY winner ORDER BY COUNT(*) DESC LIMIT 1;",
-                insights: null,
-                chart_spec: null,
-              }),
-            50
-          )
-        )
+    // User message appears synchronously before the generator is iterated.
+    // Use the default stream mock (sql_ready → answer_ready) which resolves normally.
+    mockQueryAgentStream.mockImplementationOnce(() =>
+      makeStream([
+        {
+          type: "sql_ready",
+          sql: "SELECT winner FROM matches GROUP BY winner ORDER BY COUNT(*) DESC LIMIT 1;",
+        },
+        { type: "answer_ready", answer: "Mumbai Indians won the most." },
+      ])
     );
 
     render(<ChatPage />);
@@ -449,7 +471,7 @@ describe("full submission flow (happy path)", () => {
     });
   });
 
-  it("calls queryAgent with correct question and thread_id", async () => {
+  it("calls queryAgentStream with correct question and thread_id", async () => {
     const threadId = "correct-params-thread";
     localStorage.setItem(THREAD_ID_KEY, threadId);
 
@@ -461,8 +483,8 @@ describe("full submission flow (happy path)", () => {
     await userEvent.click(screen.getByRole("button", { name: /submit question/i }));
 
     await waitFor(() => {
-      expect(mockQueryAgent).toHaveBeenCalledTimes(1);
-      expect(mockQueryAgent).toHaveBeenCalledWith({
+      expect(mockQueryAgentStream).toHaveBeenCalledTimes(1);
+      expect(mockQueryAgentStream).toHaveBeenCalledWith({
         question: "How many sixes in 2022?",
         thread_id: threadId,
       });
@@ -473,12 +495,15 @@ describe("full submission flow (happy path)", () => {
     const threadId = "assistant-msg-thread";
     localStorage.setItem(THREAD_ID_KEY, threadId);
 
-    mockQueryAgent.mockResolvedValueOnce({
-      answer: "Jasprit Bumrah took the most wickets.",
-      sql: "SELECT bowler, COUNT(*) FROM deliveries WHERE dismissal_kind IS NOT NULL GROUP BY bowler ORDER BY 2 DESC LIMIT 1;",
-      insights: null,
-      chart_spec: null,
-    });
+    mockQueryAgentStream.mockImplementationOnce(() =>
+      makeStream([
+        {
+          type: "sql_ready",
+          sql: "SELECT bowler, COUNT(*) FROM deliveries WHERE dismissal_kind IS NOT NULL GROUP BY bowler ORDER BY 2 DESC LIMIT 1;",
+        },
+        { type: "answer_ready", answer: "Jasprit Bumrah took the most wickets." },
+      ])
+    );
 
     render(<ChatPage />);
     await act(async () => {});
@@ -526,7 +551,7 @@ describe("full submission flow (happy path)", () => {
     await userEvent.click(screen.getByRole("button", { name: /submit question/i }));
 
     await waitFor(() => {
-      expect(mockQueryAgent).toHaveBeenCalledWith(
+      expect(mockQueryAgentStream).toHaveBeenCalledWith(
         expect.objectContaining({ question: "Who scored the most?" })
       );
     });
@@ -542,7 +567,7 @@ describe("full submission flow (happy path)", () => {
     // Submit button is disabled when input is empty
     const submitButton = screen.getByRole("button", { name: /submit question/i });
     expect(submitButton).toBeDisabled();
-    expect(mockQueryAgent).not.toHaveBeenCalled();
+    expect(mockQueryAgentStream).not.toHaveBeenCalled();
   });
 });
 
@@ -551,11 +576,11 @@ describe("full submission flow (happy path)", () => {
 // ---------------------------------------------------------------------------
 
 describe("error handling", () => {
-  it("shows an error alert when queryAgent rejects", async () => {
+  it("shows an error alert when queryAgentStream throws", async () => {
     const threadId = "error-handling-thread";
     localStorage.setItem(THREAD_ID_KEY, threadId);
 
-    mockQueryAgent.mockRejectedValueOnce(new Error("Rate limit exceeded"));
+    mockQueryAgentStream.mockImplementationOnce(() => makeErrorStream("Rate limit exceeded"));
 
     render(<ChatPage />);
     await act(async () => {});
@@ -576,8 +601,8 @@ describe("error handling", () => {
     const threadId = "error-detail-thread";
     localStorage.setItem(THREAD_ID_KEY, threadId);
 
-    mockQueryAgent.mockRejectedValueOnce(
-      new Error("Too many requests — you are limited to 20/minute")
+    mockQueryAgentStream.mockImplementationOnce(() =>
+      makeErrorStream("Too many requests — you are limited to 20/minute")
     );
 
     render(<ChatPage />);
@@ -596,12 +621,14 @@ describe("error handling", () => {
     });
   });
 
-  it("shows a generic message for non-Error rejections", async () => {
+  it("shows a generic message for non-Error throws", async () => {
     const threadId = "generic-error-thread";
     localStorage.setItem(THREAD_ID_KEY, threadId);
 
-    // Reject with a plain string, not an Error instance
-    mockQueryAgent.mockRejectedValueOnce("unknown failure");
+    // Throw a plain string (not an Error instance) from the generator
+    mockQueryAgentStream.mockImplementationOnce(async function* () {
+      throw "unknown failure"; // eslint-disable-line @typescript-eslint/no-throw-literal
+    } as typeof queryAgentStream);
 
     render(<ChatPage />);
     await act(async () => {});
@@ -621,15 +648,15 @@ describe("error handling", () => {
     const threadId = "error-clear-on-success";
     localStorage.setItem(THREAD_ID_KEY, threadId);
 
-    // First call fails
-    mockQueryAgent
-      .mockRejectedValueOnce(new Error("Temporary failure"))
-      .mockResolvedValueOnce({
-        answer: "Everything is fine now.",
-        sql: "SELECT 1;",
-        insights: null,
-        chart_spec: null,
-      });
+    // First call fails, second succeeds
+    mockQueryAgentStream
+      .mockImplementationOnce(() => makeErrorStream("Temporary failure"))
+      .mockImplementationOnce(() =>
+        makeStream([
+          { type: "sql_ready", sql: "SELECT 1;" },
+          { type: "answer_ready", answer: "Everything is fine now." },
+        ])
+      );
 
     render(<ChatPage />);
     await act(async () => {});
