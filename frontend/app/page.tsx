@@ -18,16 +18,37 @@ import { queryAgent } from "@/lib/api";
  *       backend's /api/query endpoint is fully implemented in agent.py.
  */
 
+const THREAD_ID_KEY = "nl2sql_thread_id";
+
 export default function ChatPage() {
-  // A stable session ID — generated once per page load, not persisted.
-  // TODO: Persist thread_id in a URL param or cookie if you want history
-  //       to survive page refreshes.
-  const [threadId] = useState<string>(() => crypto.randomUUID());
+  // Stable session ID — loaded from localStorage on mount so history survives
+  // page refreshes. Falls back to a new UUID if no prior session exists.
+  // Uses a placeholder until the effect fires to avoid SSR/hydration mismatches.
+  const [threadId, setThreadId] = useState<string>("");
+
+  useEffect(() => {
+    let id = localStorage.getItem(THREAD_ID_KEY);
+    if (!id) {
+      id = crypto.randomUUID();
+      localStorage.setItem(THREAD_ID_KEY, id);
+    }
+    setThreadId(id);
+  }, []);
 
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  /** Start a new conversation — clears UI state and issues a fresh thread ID. */
+  const handleNewSession = useCallback(() => {
+    const id = crypto.randomUUID();
+    localStorage.setItem(THREAD_ID_KEY, id);
+    setThreadId(id);
+    setMessages([]);
+    setInput("");
+    setError(null);
+  }, []);
 
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -43,7 +64,7 @@ export default function ChatPage() {
    */
   const submitQuestion = useCallback(
     async (question: string) => {
-      if (!question.trim() || loading) return;
+      if (!question.trim() || loading || !threadId) return;
 
       const userMessage: Message = {
         id: crypto.randomUUID(),
@@ -110,11 +131,23 @@ export default function ChatPage() {
   return (
     <main className="flex flex-col h-full max-w-4xl mx-auto px-4">
       {/* Header */}
-      <header className="py-6 border-b border-gray-800 flex-shrink-0">
-        <h1 className="text-2xl font-semibold tracking-tight">NL2SQL Agent</h1>
-        <p className="text-sm text-gray-400 mt-1">
-          Ask questions in plain English — get answers powered by SQL.
-        </p>
+      <header className="py-6 border-b border-gray-800 flex-shrink-0 flex items-center justify-between">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight">NL2SQL Agent</h1>
+          <p className="text-sm text-gray-400 mt-1">
+            Ask questions in plain English — get answers powered by SQL.
+          </p>
+        </div>
+        <button
+          onClick={handleNewSession}
+          disabled={loading}
+          className="text-xs text-gray-400 border border-gray-700 rounded-lg px-3 py-1.5
+                     hover:text-gray-200 hover:border-gray-500 transition-colors
+                     disabled:opacity-40 disabled:cursor-not-allowed"
+          title="Clear conversation and start a new session"
+        >
+          New session
+        </button>
       </header>
 
       {/* Message list */}

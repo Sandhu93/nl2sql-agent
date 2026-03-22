@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException, Request, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import Any
+import uuid
 import logging
 
 import asyncio
@@ -20,8 +21,28 @@ settings = get_settings()
 
 
 class QueryRequest(BaseModel):
-    question: str = Field(..., min_length=1, max_length=2000, description="Natural-language question")
-    thread_id: str = Field(..., min_length=1, max_length=128, description="Session thread identifier")
+    question: str = Field(..., min_length=1, max_length=500, description="Natural-language question (max 500 chars)")
+    thread_id: str = Field(..., min_length=1, max_length=128, description="Session thread identifier (UUID v4)")
+
+    @field_validator("thread_id")
+    @classmethod
+    def thread_id_must_be_uuid4(cls, v: str) -> str:
+        """Reject non-UUID thread_id values to prevent Redis key injection.
+
+        Without this guard a malicious client could pass e.g. 'schema_hash' as
+        thread_id, causing run_agent() to write conversation history under the
+        key nl2sql:schema_hash — overwriting the schema drift baseline used by
+        schema_watcher.py and corrupting startup checks.
+        """
+        try:
+            parsed = uuid.UUID(v, version=4)
+        except ValueError:
+            raise ValueError("thread_id must be a valid UUID v4")
+        # uuid.UUID normalises the string; if the input was a UUID v4 the
+        # canonical form will round-trip correctly.
+        if str(parsed) != v.lower():
+            raise ValueError("thread_id must be a valid UUID v4")
+        return v
 
 
 class QueryResponse(BaseModel):
