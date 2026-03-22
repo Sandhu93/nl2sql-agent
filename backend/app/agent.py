@@ -223,8 +223,8 @@ def _get_history(thread_id: str) -> ChatMessageHistory | RedisChatMessageHistory
     ChatMessageHistory otherwise so local dev without Redis still works.
     """
     if _redis_available:
-        # TODO: bump TTL on each access by calling expire() after add_* if you
-        #       want a sliding-window TTL instead of a fixed one from creation.
+        # TTL is already sliding: RedisChatMessageHistory.add_message() calls
+        # redis_client.expire(key, ttl) on every write (langchain-community 0.2.x).
         return RedisChatMessageHistory(
             session_id=f"nl2sql:{thread_id}",
             url=settings.redis_url,
