@@ -436,3 +436,210 @@ class TestGenerateInsightsGracefulFailure:
             )
 
         assert len(result["follow_up_chips"]) <= 3
+
+
+# ---------------------------------------------------------------------------
+# generate_insights — invoke_fn routing
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestGenerateInsightsInvokeFn:
+    """
+    Tests for the invoke_fn parameter added to generate_insights().
+
+    When invoke_fn is provided it must be called instead of chain.ainvoke.
+    When invoke_fn is None the chain's own .ainvoke must be used.
+    Errors raised by invoke_fn are caught and result in empty defaults.
+    """
+
+    @pytest.mark.asyncio
+    async def test_invoke_fn_is_called_when_provided(self):
+        """
+        When invoke_fn is passed, the LLM call must be routed through it.
+        The function records (chain, inputs) and returns a valid JSON string.
+        """
+        import json
+        from unittest.mock import patch
+
+        calls_recorded: list[tuple] = []
+
+        mock_response = json.dumps({
+            "key_takeaway": "Kohli leads by a wide margin.",
+            "follow_up_chips": [
+                "What is Kohli's strike rate?",
+                "How many sixes did Kohli hit?",
+                "Who is closest to Kohli's tally?",
+            ],
+        })
+
+        async def recording_invoke_fn(chain, inputs):
+            calls_recorded.append((chain, inputs))
+            return mock_response
+
+        mock_prompt = _make_mock_chain(return_value=mock_response)
+
+        with patch("app.insights_agent._INSIGHTS_PROMPT", mock_prompt):
+            result = await generate_insights(
+                question="Who scored most runs?",
+                result="[('V Kohli', 6624), ('S Dhawan', 5784)]",
+                llm=MagicMock(),
+                invoke_fn=recording_invoke_fn,
+            )
+
+        # invoke_fn must have been called exactly once
+        assert len(calls_recorded) == 1, (
+            "invoke_fn should be called exactly once for the LLM step"
+        )
+        # The inputs dict must contain question and result keys
+        _, inputs_passed = calls_recorded[0]
+        assert "question" in inputs_passed
+        assert "result" in inputs_passed
+        # The returned result must carry the LLM response content
+        assert result["key_takeaway"] == "Kohli leads by a wide margin."
+
+    @pytest.mark.asyncio
+    async def test_chain_ainvoke_used_when_invoke_fn_is_none(self):
+        """
+        When invoke_fn=None (the default), chain.ainvoke must be used directly.
+        invoke_fn must NOT be consulted at all.
+        """
+        import json
+        from unittest.mock import patch
+
+        # Track whether any external invoke_fn would have been called
+        invoke_fn_call_count = 0
+
+        async def should_not_be_called(chain, inputs):
+            nonlocal invoke_fn_call_count
+            invoke_fn_call_count += 1
+            return "{}"
+
+        mock_response = json.dumps({
+            "key_takeaway": "MI dominates.",
+            "follow_up_chips": ["Who are MIs top scorers?", "MI win rate?", "MIs best bowlers?"],
+        })
+        mock_prompt = _make_mock_chain(return_value=mock_response)
+
+        with patch("app.insights_agent._INSIGHTS_PROMPT", mock_prompt):
+            result = await generate_insights(
+                question="How did Mumbai Indians perform?",
+                result="[('Mumbai Indians', 12)]",
+                llm=MagicMock(),
+                invoke_fn=None,  # explicit None — chain.ainvoke must be used
+            )
+
+        # The external invoke_fn must NOT have been called
+        assert invoke_fn_call_count == 0
+
+        # Verify output still has the expected shape
+        assert "key_takeaway" in result
+        assert "follow_up_chips" in result
+
+    @pytest.mark.asyncio
+    async def test_invoke_fn_default_is_none(self):
+        """
+        Calling generate_insights without invoke_fn must not raise — confirms
+        backward-compatible signature (invoke_fn defaults to None).
+        """
+        import json
+        from unittest.mock import patch
+
+        mock_response = json.dumps({
+            "key_takeaway": "Rohit leads.",
+            "follow_up_chips": ["Rohit centuries?", "Rohit vs Kohli?", "Rohit highest score?"],
+        })
+        mock_prompt = _make_mock_chain(return_value=mock_response)
+
+        with patch("app.insights_agent._INSIGHTS_PROMPT", mock_prompt):
+            # No invoke_fn argument passed at all
+            result = await generate_insights(
+                question="How many runs did Rohit Sharma score?",
+                result="[('RG Sharma', 5611)]",
+                llm=MagicMock(),
+            )
+
+        assert isinstance(result, dict)
+        assert "key_takeaway" in result
+
+    @pytest.mark.asyncio
+    async def test_invoke_fn_error_returns_empty_defaults(self):
+        """
+        If invoke_fn raises any exception the failure must be swallowed and
+        generate_insights must return empty defaults — never propagate.
+        """
+        from unittest.mock import patch
+
+        async def failing_invoke_fn(chain, inputs):
+            raise ConnectionError("Semaphore circuit open")
+
+        mock_prompt = _make_mock_chain(return_value="{}")
+
+        with patch("app.insights_agent._INSIGHTS_PROMPT", mock_prompt):
+            result = await generate_insights(
+                question="Who took most wickets?",
+                result="[('JJ Bumrah', 145), ('R Ashwin', 140)]",
+                llm=MagicMock(),
+                invoke_fn=failing_invoke_fn,
+            )
+
+        # Must not raise — must return the safe empty shape
+        assert isinstance(result, dict)
+        assert result["key_takeaway"] == ""
+        assert isinstance(result["follow_up_chips"], list)
+
+    @pytest.mark.asyncio
+    async def test_invoke_fn_receives_truncated_result(self):
+        """
+        The result string passed to invoke_fn must be truncated to 2000 chars.
+        This guards against sending huge SQL results to the LLM.
+        """
+        import json
+        from unittest.mock import patch
+
+        captured_inputs: list[dict] = []
+
+        async def capturing_invoke_fn(chain, inputs):
+            captured_inputs.append(inputs)
+            return json.dumps({"key_takeaway": "test", "follow_up_chips": []})
+
+        long_result = "[('Player', 100)]" + "x" * 5000  # well over 2000 chars
+        mock_prompt = _make_mock_chain(return_value="{}")
+
+        with patch("app.insights_agent._INSIGHTS_PROMPT", mock_prompt):
+            await generate_insights(
+                question="Top scorers?",
+                result=long_result,
+                llm=MagicMock(),
+                invoke_fn=capturing_invoke_fn,
+            )
+
+        assert len(captured_inputs) == 1
+        # The result slice in inputs must be at most 2000 chars
+        assert len(captured_inputs[0]["result"]) <= 2000
+
+    @pytest.mark.asyncio
+    async def test_invoke_fn_receives_question_verbatim(self):
+        """
+        invoke_fn must receive the question exactly as passed — no mutation.
+        """
+        import json
+        from unittest.mock import patch
+
+        captured_inputs: list[dict] = []
+
+        async def capturing_invoke_fn(chain, inputs):
+            captured_inputs.append(inputs)
+            return json.dumps({"key_takeaway": "ok", "follow_up_chips": []})
+
+        question = "Which team won the most matches in 2023?"
+        mock_prompt = _make_mock_chain(return_value="{}")
+
+        with patch("app.insights_agent._INSIGHTS_PROMPT", mock_prompt):
+            await generate_insights(
+                question=question,
+                result="[('MI', 10)]",
+                llm=MagicMock(),
+                invoke_fn=capturing_invoke_fn,
+            )
+
+        assert captured_inputs[0]["question"] == question

@@ -170,18 +170,27 @@ async def generate_insights(
     result: str,
     llm,
     recent_chips: list[str] | None = None,
+    invoke_fn=None,
 ) -> dict:
     """
     Generate conditional insight + follow-up chips.
 
     `recent_chips` allows cross-turn dedupe to avoid repeating suggestions.
+    `invoke_fn`: optional coroutine ``(chain, inputs) -> result`` used to route
+        the LLM call through a semaphore and circuit breaker (e.g. agent._llm_invoke).
+        When omitted the chain is called directly (backward-compatible).
     """
     recent_chips = recent_chips or []
     rows = _parse_result_rows(result)
     rich_output = _is_rich_output(question, rows)
 
+    async def _invoke(chain, inputs: dict):
+        if invoke_fn is not None:
+            return await invoke_fn(chain, inputs)
+        return await chain.ainvoke(inputs)
+
     try:
-        raw: str = await (_INSIGHTS_PROMPT | llm | StrOutputParser()).ainvoke({
+        raw: str = await _invoke(_INSIGHTS_PROMPT | llm | StrOutputParser(), {
             "question": question,
             "result": result[:2000],
         })

@@ -4,16 +4,18 @@ Unit tests for viz_agent.py.
 Covers:
   - wants_visualization(): regex intent detection
   - _parse_result_to_rows(): SQL result string → list of dicts
+  - _extract_chart_intent(): invoke_fn routing and fallback on error
 
 Bug #30 regression: _parse_result_to_rows() must handle Decimal('15.00')
 constructor strings produced by psycopg2 for NUMERIC/DECIMAL columns.
 
-No LLM or MCP calls — those are tested at integration level.
+No real LLM or MCP calls — all external dependencies are mocked.
 """
 
 import pytest
+from unittest.mock import AsyncMock, MagicMock, patch
 
-from app.viz_agent import wants_visualization, _parse_result_to_rows
+from app.viz_agent import wants_visualization, _parse_result_to_rows, _extract_chart_intent
 
 
 # ---------------------------------------------------------------------------
@@ -183,3 +185,176 @@ class TestParseResultToRows:
         # Single tuple gets wrapped in a list
         assert len(rows) == 1
         assert rows[0]["batsman"] == "V Kohli"
+
+
+# ---------------------------------------------------------------------------
+# _extract_chart_intent — invoke_fn routing
+# ---------------------------------------------------------------------------
+
+def _make_intent_chain(return_value=None, side_effect=None):
+    """
+    Build a mock that simulates the (_INTENT_PROMPT | llm | StrOutputParser()) chain.
+
+    _extract_chart_intent builds: (_INTENT_PROMPT | llm | StrOutputParser()).ainvoke(...)
+    We patch _INTENT_PROMPT so the pipe-chain collapses to a single mock whose
+    ainvoke is controlled by us.
+    """
+    import json as _json
+
+    final_chain = MagicMock()
+    if side_effect is not None:
+        final_chain.ainvoke = AsyncMock(side_effect=side_effect)
+    else:
+        final_chain.ainvoke = AsyncMock(return_value=return_value)
+
+    intermediate = MagicMock()
+    intermediate.__or__ = MagicMock(return_value=final_chain)
+
+    mock_prompt = MagicMock()
+    mock_prompt.__or__ = MagicMock(return_value=intermediate)
+
+    return mock_prompt
+
+
+@pytest.mark.unit
+class TestExtractChartIntentInvokeFn:
+    """
+    Tests for the invoke_fn parameter in _extract_chart_intent().
+
+    invoke_fn is the semaphore/circuit-breaker hook passed down from
+    generate_chart_spec. When provided it intercepts the LLM call; when
+    absent the chain's own .ainvoke is used. Failures always fall back to
+    safe defaults — never propagate.
+    """
+
+    @pytest.mark.asyncio
+    async def test_invoke_fn_is_called_when_provided(self):
+        """invoke_fn must be called instead of chain.ainvoke when provided."""
+        import json
+
+        calls: list[tuple] = []
+        mock_response = json.dumps({
+            "chart_type": "bar",
+            "x_field": "batsman",
+            "y_field": "total_runs",
+            "x_label": "Batsman",
+            "y_label": "Total Runs",
+            "title": "Top Run Scorers",
+        })
+
+        async def recording_invoke_fn(chain, inputs):
+            calls.append((chain, inputs))
+            return mock_response
+
+        mock_prompt = _make_intent_chain(return_value=mock_response)
+
+        with patch("app.viz_agent._INTENT_PROMPT", mock_prompt):
+            intent = await _extract_chart_intent(
+                question="Show a bar chart of top run scorers",
+                result_preview="[('V Kohli', 6624)]",
+                llm=MagicMock(),
+                invoke_fn=recording_invoke_fn,
+            )
+
+        assert len(calls) == 1, "invoke_fn must be called exactly once"
+        # Confirm the extracted intent reflects the mocked LLM response
+        assert intent["chart_type"] == "bar"
+        assert intent["x_field"] == "batsman"
+        assert intent["y_field"] == "total_runs"
+
+    @pytest.mark.asyncio
+    async def test_chain_ainvoke_used_when_invoke_fn_is_none(self):
+        """When invoke_fn=None, chain.ainvoke must handle the LLM call directly."""
+        import json
+
+        external_calls = 0
+
+        async def should_not_be_called(chain, inputs):
+            nonlocal external_calls
+            external_calls += 1
+            return "{}"
+
+        mock_response = json.dumps({
+            "chart_type": "line",
+            "x_field": "year",
+            "y_field": "wins",
+            "x_label": "Year",
+            "y_label": "Wins",
+            "title": "Wins Over Time",
+        })
+        mock_prompt = _make_intent_chain(return_value=mock_response)
+
+        with patch("app.viz_agent._INTENT_PROMPT", mock_prompt):
+            intent = await _extract_chart_intent(
+                question="Plot wins per year as a line chart",
+                result_preview="[(2019, 10), (2020, 8)]",
+                llm=MagicMock(),
+                invoke_fn=None,
+            )
+
+        assert external_calls == 0, "invoke_fn must not be called when it is None"
+        assert intent["chart_type"] == "line"
+
+    @pytest.mark.asyncio
+    async def test_invoke_fn_error_falls_back_to_safe_defaults(self):
+        """
+        If invoke_fn raises, _extract_chart_intent must catch it and return the
+        safe default intent dict — never re-raise.
+        """
+        async def failing_invoke_fn(chain, inputs):
+            raise RuntimeError("Circuit breaker open")
+
+        mock_prompt = _make_intent_chain(return_value="{}")
+
+        with patch("app.viz_agent._INTENT_PROMPT", mock_prompt):
+            intent = await _extract_chart_intent(
+                question="Show a chart of wickets",
+                result_preview="[('JJ Bumrah', 145)]",
+                llm=MagicMock(),
+                invoke_fn=failing_invoke_fn,
+            )
+
+        # Safe defaults must be returned
+        assert intent["chart_type"] == "bar"
+        assert intent["x_field"] == "category"
+        assert intent["y_field"] == "value"
+
+    @pytest.mark.asyncio
+    async def test_invoke_fn_passed_through_from_generate_chart_spec(self):
+        """
+        generate_chart_spec must forward its invoke_fn argument down to
+        _extract_chart_intent — not swallow it.
+        """
+        import json
+        from app.viz_agent import generate_chart_spec
+
+        intent_invoke_calls: list = []
+
+        async def tracking_invoke_fn(chain, inputs):
+            intent_invoke_calls.append(inputs)
+            return json.dumps({
+                "chart_type": "bar",
+                "x_field": "batsman",
+                "y_field": "runs",
+                "x_label": "Batsman",
+                "y_label": "Runs",
+                "title": "Top Scorers",
+            })
+
+        with patch("app.viz_agent._call_mcp_generate_chart", new_callable=AsyncMock) as mock_mcp, \
+             patch("app.viz_agent._INTENT_PROMPT", _make_intent_chain(return_value="{}")):
+            # MCP returns None to force the fallback path; we only care that
+            # intent extraction received invoke_fn
+            mock_mcp.return_value = None
+
+            await generate_chart_spec(
+                question="Show a bar chart of top scorers",
+                result="[('V Kohli', 6624), ('S Dhawan', 5784)]",
+                llm=MagicMock(),
+                invoke_fn=tracking_invoke_fn,
+            )
+
+        # tracking_invoke_fn must have been called during intent extraction
+        assert len(intent_invoke_calls) >= 1, (
+            "invoke_fn must be forwarded to _extract_chart_intent"
+        )

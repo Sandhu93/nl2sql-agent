@@ -81,15 +81,22 @@ _INTENT_PROMPT = PromptTemplate.from_template(
 )
 
 
-async def _extract_chart_intent(question: str, result_preview: str, llm) -> dict:
+async def _extract_chart_intent(question: str, result_preview: str, llm, invoke_fn=None) -> dict:
     """
     Use a small LLM call to determine chart type and column field names.
 
     Returns a dict with keys: chart_type, x_field, y_field, x_label, y_label, title.
     Falls back to safe defaults if the LLM call or JSON parse fails.
+    `invoke_fn`: optional coroutine ``(chain, inputs) -> result`` for semaphore +
+        circuit breaker coverage. When omitted the chain is called directly.
     """
+    async def _invoke(chain, inputs: dict):
+        if invoke_fn is not None:
+            return await invoke_fn(chain, inputs)
+        return await chain.ainvoke(inputs)
+
     try:
-        raw: str = await (_INTENT_PROMPT | llm | StrOutputParser()).ainvoke({
+        raw: str = await _invoke(_INTENT_PROMPT | llm | StrOutputParser(), {
             "question": question,
             "result_preview": result_preview[:400],
         })
@@ -224,10 +231,123 @@ async def _call_mcp_generate_chart(
 
 
 # ---------------------------------------------------------------------------
+# Spec validation — runs after MCP response and after fallback build
+# ---------------------------------------------------------------------------
+
+def _validate_vega_lite_spec(spec: dict) -> bool:
+    """
+    Validate that a Vega-Lite v5 spec has the required structure before
+    passing it to the frontend.
+
+    Checks:
+      - Required top-level keys: $schema, data, mark, encoding
+      - data.values is a non-empty list (chart has actual data to render)
+      - mark is a string or a dict with a 'type' key
+      - encoding is a non-empty dict
+
+    Returns True when the spec is safe to send to the frontend.
+    """
+    if not isinstance(spec, dict):
+        return False
+
+    required = {"$schema", "data", "mark", "encoding"}
+    missing = required - spec.keys()
+    if missing:
+        logger.warning("Vega-Lite spec missing required keys: %s", missing)
+        return False
+
+    data = spec.get("data", {})
+    if not isinstance(data, dict) or not isinstance(data.get("values"), list) or not data["values"]:
+        logger.warning("Vega-Lite spec has no data values")
+        return False
+
+    mark = spec.get("mark")
+    if isinstance(mark, dict) and "type" not in mark:
+        logger.warning("Vega-Lite mark dict missing 'type' key")
+        return False
+    if not isinstance(mark, (str, dict)):
+        logger.warning("Vega-Lite mark is not a string or dict: %r", mark)
+        return False
+
+    if not isinstance(spec.get("encoding"), dict) or not spec["encoding"]:
+        logger.warning("Vega-Lite encoding is empty or missing")
+        return False
+
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Fallback renderer — mirrors MCP server logic; used when MCP is unreachable
+# ---------------------------------------------------------------------------
+
+def _build_fallback_spec(data_rows: list[dict], intent: dict) -> dict | None:
+    """
+    Build a deterministic Vega-Lite v5 spec in-process when the MCP chart
+    server is unavailable.
+
+    Replicates the same spec structure as mcp_chart_server/server.py so the
+    frontend receives an identical format regardless of which path produced it.
+    Returns None only when data_rows is empty (nothing to render).
+
+    TODO: Keep this in sync with mcp_chart_server/server.py if the MCP spec
+          structure ever changes (e.g. new chart types, encoding overrides).
+    """
+    if not data_rows:
+        return None
+
+    chart_type = intent.get("chart_type", "bar").lower().strip()
+    if chart_type not in ("bar", "line", "point"):
+        chart_type = "bar"
+
+    x_field = intent.get("x_field", "category")
+    y_field = intent.get("y_field", "value")
+    x_label = intent.get("x_label", "") or x_field
+    y_label = intent.get("y_label", "") or y_field
+    title   = intent.get("title", "")
+
+    tooltip = [
+        {"field": x_field, "type": "nominal" if chart_type != "point" else "quantitative"},
+        {"field": y_field, "type": "quantitative"},
+    ]
+
+    if chart_type == "bar":
+        encoding = {
+            "y": {"field": x_field, "type": "nominal", "sort": "-x", "axis": {"title": x_label}},
+            "x": {"field": y_field, "type": "quantitative", "axis": {"title": y_label}},
+            "tooltip": tooltip,
+        }
+    elif chart_type == "line":
+        encoding = {
+            "x": {"field": x_field, "type": "ordinal", "axis": {"title": x_label}},
+            "y": {"field": y_field, "type": "quantitative", "axis": {"title": y_label}},
+            "tooltip": tooltip,
+        }
+    else:  # point / scatter
+        encoding = {
+            "x": {"field": x_field, "type": "quantitative", "axis": {"title": x_label}},
+            "y": {"field": y_field, "type": "quantitative", "axis": {"title": y_label}},
+            "tooltip": [
+                {"field": x_field, "type": "quantitative"},
+                {"field": y_field, "type": "quantitative"},
+            ],
+        }
+
+    return {
+        "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+        "width": 600,
+        "height": 350,
+        "title": title,
+        "data": {"values": data_rows[:20]},
+        "mark": {"type": chart_type, "tooltip": True},
+        "encoding": encoding,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Public entry point — called from agent.py
 # ---------------------------------------------------------------------------
 
-async def generate_chart_spec(question: str, result: str, llm) -> dict | None:
+async def generate_chart_spec(question: str, result: str, llm, invoke_fn=None) -> dict | None:
     """
     Generate a Vega-Lite v5 spec for the given SQL result via the MCP chart server.
 
@@ -237,9 +357,12 @@ async def generate_chart_spec(question: str, result: str, llm) -> dict | None:
       3. _call_mcp_generate_chart() — MCP tool builds the deterministic spec
 
     Args:
-        question: The standalone natural-language question.
-        result:   Raw SQL result string from QuerySQLDataBaseTool.
-        llm:      The LLM instance (primary + fallbacks) from agent.py.
+        question:  The standalone natural-language question.
+        result:    Raw SQL result string from QuerySQLDataBaseTool.
+        llm:       The LLM instance (primary + fallbacks) from agent.py.
+        invoke_fn: Optional coroutine ``(chain, inputs) -> result`` for semaphore +
+                   circuit breaker coverage (e.g. agent._llm_invoke). When omitted
+                   the intent-extraction LLM call is made directly.
 
     Returns:
         Vega-Lite spec dict, or None if any step fails or spec is invalid.
@@ -247,7 +370,7 @@ async def generate_chart_spec(question: str, result: str, llm) -> dict | None:
     mcp_url = settings.mcp_chart_server_url
 
     # Step 1 — extract chart intent (cheap LLM call for type + field names only)
-    intent = await _extract_chart_intent(question, result, llm)
+    intent = await _extract_chart_intent(question, result, llm, invoke_fn=invoke_fn)
     logger.info(
         "Chart intent | chart_type=%s | x=%s | y=%s",
         intent["chart_type"], intent["x_field"], intent["y_field"],
@@ -260,4 +383,19 @@ async def generate_chart_spec(question: str, result: str, llm) -> dict | None:
         return None
 
     # Step 3 — call the MCP chart server for the deterministic spec
-    return await _call_mcp_generate_chart(data_rows, intent, mcp_url)
+    spec = await _call_mcp_generate_chart(data_rows, intent, mcp_url)
+
+    # Step 3a — validate the MCP response before trusting it
+    if spec is not None:
+        if _validate_vega_lite_spec(spec):
+            return spec
+        logger.warning("MCP chart spec failed validation — falling back to in-process renderer")
+        spec = None
+
+    # Step 3b — MCP unavailable or returned an invalid spec: build in-process
+    # This mirrors mcp_chart_server/server.py so the frontend sees the same format.
+    # TODO: keep _build_fallback_spec in sync if mcp_chart_server/server.py changes.
+    fallback = _build_fallback_spec(data_rows, intent)
+    if fallback is not None:
+        logger.info("Chart spec built via fallback renderer | chart_type=%s", intent.get("chart_type"))
+    return fallback

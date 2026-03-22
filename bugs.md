@@ -4,6 +4,45 @@ Chronological record of every bug, error, and issue encountered during developme
 
 ---
 
+## #59 — `generate_insights` and `generate_chart_spec` bypassed semaphore + circuit breaker
+
+**Symptom**
+Under concurrent load (e.g. Locust 10-user run), the LLM semaphore limit of 5 was effectively bypassed. Each request could fire up to 3 unguarded LLM calls (insights + viz intent extraction + rephrase) alongside the guarded ones, allowing well above 5 simultaneous in-flight requests to OpenAI.
+
+**Root cause**
+`generate_insights()` in `insights_agent.py` and `_extract_chart_intent()` in `viz_agent.py` called `chain.ainvoke()` directly. Only `agent.py` calls went through `_llm_invoke()`, which gates on the semaphore and records failures for the circuit breaker. The two satellite modules were always outside this gate.
+
+**Fix**
+Added an `invoke_fn=None` parameter to `generate_insights`, `_extract_chart_intent`, and `generate_chart_spec`. When provided, the LLM call is routed through `invoke_fn(chain, inputs)` instead of `chain.ainvoke(inputs)`. `agent.py` now passes `invoke_fn=_llm_invoke` at both call sites, so all five parallel LLM calls in the pipeline (rephrase, insights, chart intent extraction + 2 from MCP path) share the same semaphore and circuit breaker.
+
+---
+
+## #60 — MCP chart spec passed to frontend without validation
+
+**Symptom**
+The Vega-Lite spec returned by the MCP chart server was forwarded directly to the frontend with no structural checks. A malformed spec (e.g. missing `encoding`, empty `data.values`, wrong `mark` shape) would cause `vega-embed` to throw a runtime error in the browser with no useful fallback.
+
+**Root cause**
+`_call_mcp_generate_chart()` returned whatever the MCP tool returned, and `generate_chart_spec()` passed it straight through without checking required Vega-Lite v5 fields.
+
+**Fix**
+Added `_validate_vega_lite_spec(spec)` in `viz_agent.py` that checks: required top-level keys (`$schema`, `data`, `mark`, `encoding`), non-empty `data.values` list, valid `mark` shape (string or dict with `type`), and non-empty `encoding` dict. `generate_chart_spec()` calls this after receiving the MCP response; an invalid spec is rejected and the fallback renderer is tried instead.
+
+---
+
+## #61 — Charts silently dropped when MCP chart server is unreachable
+
+**Symptom**
+If the `mcp_chart_server` container was restarting or the SSE connection timed out, `_call_mcp_generate_chart()` returned `None`, `generate_chart_spec()` returned `None`, and the frontend showed no chart at all — even though the SQL result was perfectly chartable.
+
+**Root cause**
+There was no fallback renderer. The design assumed MCP availability but provided no degradation path.
+
+**Fix**
+Added `_build_fallback_spec(data_rows, intent)` in `viz_agent.py`. It replicates the same Vega-Lite v5 structure as `mcp_chart_server/server.py` deterministically (bar, line, point types; same field/axis encoding). When MCP is down or returns an invalid spec, `generate_chart_spec()` calls `_build_fallback_spec()` before returning `None`. Charts render correctly in all MCP failure modes.
+
+---
+
 
 ## #1 — `npm ci` fails: no `package-lock.json`
 

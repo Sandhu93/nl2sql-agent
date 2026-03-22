@@ -270,10 +270,8 @@ def _set_recent_chips(thread_id: str, chips: list[str]) -> None:
 #
 # All direct .ainvoke() calls in this module go through _llm_invoke() which
 # acquires the semaphore first.  generate_insights() and generate_chart_spec()
-# (separate modules, 1 cheap LLM call each) are not guarded here — they are
-# non-blocking/silent-failure helpers and their load is lower priority.
-# TODO: pass the semaphore into insights_agent and viz_agent if their LLM call
-#       volume becomes significant under heavier load.
+# also receive _llm_invoke as their invoke_fn so every LLM call site in the
+# pipeline is covered by both the semaphore cap and the circuit breaker.
 # ---------------------------------------------------------------------------
 _llm_semaphore: asyncio.Semaphore | None = None
 
@@ -955,17 +953,19 @@ async def run_agent(question: str, thread_id: str) -> dict[str, str]:
         """Run chart spec generation only when the question asks for a viz."""
         if not viz_requested:
             return None
-        return await generate_chart_spec(standalone_question, result, _fast_llm)
+        # invoke_fn routes the intent-extraction LLM call through the semaphore
+        # and circuit breaker alongside all other LLM calls in this pipeline.
+        return await generate_chart_spec(standalone_question, result, _fast_llm, invoke_fn=_llm_invoke)
 
-    # TODO: pass _llm_semaphore into generate_insights / generate_chart_spec if
-    #       their LLM call volume becomes significant under heavier load.
+    # All three parallel steps now route their LLM calls through _llm_invoke so
+    # the concurrency semaphore and circuit breaker cover every LLM call site.
     answer, insights, chart_spec = await asyncio.gather(
         _llm_invoke(rephrase_answer, {
             "question": standalone_question,
             "query": sql,
             "result": result,
         }),
-        generate_insights(standalone_question, result, _fast_llm, recent_chips=recent_chips),
+        generate_insights(standalone_question, result, _fast_llm, recent_chips=recent_chips, invoke_fn=_llm_invoke),
         _maybe_chart(),
     )
     logger.info("Rephrased answer: %s", answer)
